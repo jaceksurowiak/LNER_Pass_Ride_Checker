@@ -1,7 +1,6 @@
 import re
 import datetime as dt
-from dataclasses import dataclass
-from typing import Optional, Dict, Set, List, Tuple
+from typing import Optional, Dict, List, Set, Tuple
 
 import pandas as pd
 import requests
@@ -10,36 +9,67 @@ from requests.auth import HTTPBasicAuth
 
 RTT_BASE = "https://api.rtt.io/api/v1"
 
-WEEKDAYS = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]
-DOW_TO_IDX = {d: i for i, d in enumerate(WEEKDAYS)}  # MON=0 .. SUN=6
+# Railway day codes (as you described)
+# SO=Saturday, Su=Sunday, MO=Monday, TO=Tuesday, WO=Wednesday, ThO=Thursday, FO=Friday
+RAIL_DAY_TO_WEEKDAY = {
+    "MO": 0,
+    "TO": 1,
+    "WO": 2,
+    "THO": 3,
+    "FO": 4,
+    "SO": 5,
+    "SU": 6,   # allow SU
+    "SU ": 6,
+}
+WEEKDAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
 
-# ----------------------------
-# Normalisation / parsing
-# ----------------------------
+# -------------------------
+# Helpers
+# -------------------------
 def norm(s: str) -> str:
     s = str(s).strip().lower()
     s = re.sub(r"[^a-z0-9 ]+", "", s)
     s = re.sub(r"\s+", " ", s)
     return s
 
+def key(s: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(s).strip().lower())
 
-def parse_ddmmyyyy(s: str) -> Optional[dt.date]:
-    if pd.isna(s):
+def find_col(df: pd.DataFrame, *candidates: str) -> Optional[str]:
+    """Loose column match: ignores case/spaces/punctuation."""
+    cols = list(df.columns)
+    km = {key(c): c for c in cols}
+
+    for w in candidates:
+        kw = key(w)
+        if kw in km:
+            return km[kw]
+
+    for w in candidates:
+        kw = key(w)
+        for c in cols:
+            if kw and kw in key(c):
+                return c
+    return None
+
+def parse_ddmmyyyy(x) -> Optional[dt.date]:
+    if pd.isna(x):
         return None
-    s = str(s).strip()
+    s = str(x).strip()
     if not s:
         return None
-    try:
-        return dt.datetime.strptime(s, "%d/%m/%Y").date()
-    except ValueError:
-        return None
+    for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d"):
+        try:
+            return dt.datetime.strptime(s, fmt).date()
+        except ValueError:
+            pass
+    return None
 
-
-def parse_hhmm(s: str) -> Optional[str]:
-    if pd.isna(s):
+def parse_hhmm(x) -> Optional[str]:
+    if pd.isna(x):
         return None
-    s = str(s).strip()
+    s = str(x).strip()
     if not s:
         return None
     m = re.match(r"^(\d{1,2}):(\d{2})$", s)
@@ -51,136 +81,86 @@ def parse_hhmm(s: str) -> Optional[str]:
         return f"{hh:02d}:{mm:02d}"
     return None
 
-
-def hhmm_to_minutes(hhmm: str) -> int:
+def hhmm_to_seconds(hhmm: str) -> int:
     hh, mm = hhmm.split(":")
-    return int(hh) * 60 + int(mm)
+    return int(hh) * 3600 + int(mm) * 60
 
-
-def within_tolerance(expected: Optional[str], actual: Optional[str], tol_min: int) -> bool:
-    if expected is None or actual is None:
+def within_30_seconds(expected_hhmm: Optional[str], actual_hhmm: Optional[str], allow_30s: bool) -> bool:
+    if expected_hhmm is None or actual_hhmm is None:
         return False
-    if tol_min <= 0:
-        return expected == actual
-    return abs(hhmm_to_minutes(expected) - hhmm_to_minutes(actual)) <= tol_min
+    if not allow_30s:
+        return expected_hhmm == actual_hhmm
+    # Treat HH:MM as HH:MM:00 and allow +/- 30 seconds
+    return abs(hhmm_to_seconds(expected_hhmm) - hhmm_to_seconds(actual_hhmm)) <= 30
 
-
-def daterange(start: dt.date, end: dt.date):
-    cur = start
-    while cur <= end:
+def daterange(d1: dt.date, d2: dt.date):
+    cur = d1
+    while cur <= d2:
         yield cur
         cur += dt.timedelta(days=1)
 
-
-def dow_code(d: dt.date) -> str:
-    return WEEKDAYS[d.weekday()]
-
-
-def parse_days_run(value: str) -> Set[str]:
+def parse_journey_days_run(value) -> Set[int]:
     """
-    Convert common 'Diagram Days Run' formats into weekday set: {"MON",...}
-    Supports:
-      - MON-FRI, MON-SAT, SAT-SUN
-      - MON,TUE,WED
-      - DAILY / EVERY DAY
-      - WEEKDAYS / WEEKENDS
-      - 'MTWTFSS' style (heuristic)
-      - 'SAT ONLY', etc.
+    Parses railway day codes like:
+      "MO", "TO", "WO", "ThO", "FO", "SO", "Su" and combinations.
+    Returns set of weekday indexes (Mon=0..Sun=6).
+
+    Accepts:
+      - "MO TO WO ThO FO" (space)
+      - "MO,TO,WO" (comma)
+      - "MOTO" (rare; we still try)
+      - Any mixture, case-insensitive
     """
     if pd.isna(value):
         return set()
-    raw = str(value).strip().upper()
+    raw = str(value).strip()
     if not raw:
         return set()
 
-    raw = raw.replace("&", " ").replace("/", " ")
-    raw = re.sub(r"\s+", " ", raw)
-    raw = raw.replace("ONLY", "").strip()
+    raw_up = raw.upper()
 
-    if raw in {"DAILY", "EVERY DAY", "EVERYDAY"}:
-        return set(WEEKDAYS)
-    if raw in {"WEEKDAYS"}:
-        return {"MON", "TUE", "WED", "THU", "FRI"}
-    if raw in {"WEEKENDS"}:
-        return {"SAT", "SUN"}
+    # normalise variants of Sunday code "Su"
+    raw_up = raw_up.replace("SU", "SU")  # keep
+    # handle "THO" written as "THO" or "TH0"? (just in case)
+    raw_up = raw_up.replace("TH0", "THO")
 
-    # Range like MON-FRI
-    m = re.match(r"^(MON|TUE|WED|THU|FRI|SAT|SUN)\s*-\s*(MON|TUE|WED|THU|FRI|SAT|SUN)$", raw)
-    if m:
-        a, b = m.group(1), m.group(2)
-        ia, ib = DOW_TO_IDX[a], DOW_TO_IDX[b]
-        if ia <= ib:
-            return set(WEEKDAYS[ia:ib + 1])
-        return set(WEEKDAYS[ia:] + WEEKDAYS[:ib + 1])
+    # Tokenise on comma/space/semicolon/slash
+    tokens = re.split(r"[,\s;/]+", raw_up)
+    tokens = [t.strip() for t in tokens if t.strip()]
 
-    # Comma/space list like MON,TUE,WED
-    tokens = re.split(r"[,\s]+", raw)
-    tokens = [t for t in tokens if t]
-    if tokens and all(t in WEEKDAYS for t in tokens):
-        return set(tokens)
+    # If it came as one blob, try to extract known codes by regex
+    if len(tokens) == 1 and len(tokens[0]) > 3:
+        blob = tokens[0]
+        found = re.findall(r"THO|MO|TO|WO|FO|SO|SU", blob)
+        tokens = found if found else tokens
 
-    # Condensed letters heuristic e.g. MTWTFSS
-    compact = re.sub(r"[^MTWFSU]", "", raw)
-    if len(compact) >= 5:
-        allowed = set()
-        if "M" in compact:
-            allowed.add("MON")
-        if "W" in compact:
-            allowed.add("WED")
-        if "F" in compact:
-            allowed.add("FRI")
-        if "T" in compact:
-            allowed.update({"TUE", "THU"})  # safe assumption
-        if "S" in compact:
-            allowed.update({"SAT", "SUN"})
-        if "U" in compact:
-            allowed.add("SUN")
-        return allowed
+    out: Set[int] = set()
+    for t in tokens:
+        t = t.strip().upper()
+        if t == "SU":  # Sunday
+            out.add(6)
+        elif t in RAIL_DAY_TO_WEEKDAY:
+            out.add(RAIL_DAY_TO_WEEKDAY[t])
+        elif t == "THO":
+            out.add(3)
+        # allow "Su" passed in mixed case
+        elif t == "SU":
+            out.add(6)
 
-    # Single day mention
-    for d in WEEKDAYS:
-        if d in raw:
-            return {d}
-
-    return set()
+    return out
 
 
-def find_col(df: pd.DataFrame, wanted: str) -> Optional[str]:
-    """
-    Find a column by "loose" matching:
-    - ignores case
-    - ignores spaces/underscores/punctuation
-    """
-    def key(s: str) -> str:
-        return re.sub(r"[^a-z0-9]+", "", str(s).strip().lower())
-
-    w = key(wanted)
-    for c in df.columns:
-        if key(c) == w:
-            return c
-
-    # fallback: contains-match
-    for c in df.columns:
-        if w in key(c):
-            return c
-
-    return None
-
-
-# ----------------------------
-# Data loading
-# ----------------------------
+# -------------------------
+# RailReferences
+# -------------------------
 @st.cache_data
-def load_pass_trips(uploaded_file) -> pd.DataFrame:
-    # pass-trips.csv often has 3 metadata lines before the header row
-    return pd.read_csv(uploaded_file, skiprows=3)
-
-
-@st.cache_data
-def load_rail_refs(uploaded_file) -> pd.DataFrame:
+def load_railrefs_from_path(path: str) -> pd.DataFrame:
     # RailReferences.csv: TIPLOC, CRS, Description (no header)
-    return pd.read_csv(uploaded_file, header=None, names=["tiploc", "crs", "description"])
+    return pd.read_csv(path, header=None, names=["tiploc", "crs", "description"])
 
+@st.cache_data
+def load_railrefs_from_upload(uploaded) -> pd.DataFrame:
+    return pd.read_csv(uploaded, header=None, names=["tiploc", "crs", "description"])
 
 def build_desc_to_crs(rail_refs: pd.DataFrame) -> Dict[str, str]:
     d: Dict[str, str] = {}
@@ -190,22 +170,22 @@ def build_desc_to_crs(rail_refs: pd.DataFrame) -> Dict[str, str]:
         if desc and crs and desc not in d:
             d[desc] = crs
 
-    # Helpful aliases (extend as needed)
+    # A few useful aliases (extend anytime)
     aliases = {
         "kings cross": "KGX",
         "london kings cross": "KGX",
         "kings x": "KGX",
-        "edinburgh": "EDB",
         "edinburgh waverley": "EDB",
+        "edinburgh": "EDB",
     }
     for k, v in aliases.items():
         d.setdefault(norm(k), v)
     return d
 
 
-# ----------------------------
+# -------------------------
 # RTT calls
-# ----------------------------
+# -------------------------
 def rtt_location_services(crs_or_tiploc: str, run_date: dt.date, auth: HTTPBasicAuth) -> dict:
     y = run_date.year
     m = f"{run_date.month:02d}"
@@ -214,7 +194,6 @@ def rtt_location_services(crs_or_tiploc: str, run_date: dt.date, auth: HTTPBasic
     r = requests.get(url, auth=auth, timeout=30)
     r.raise_for_status()
     return r.json()
-
 
 def flatten_location_services(payload: dict) -> pd.DataFrame:
     services = payload.get("services", []) or []
@@ -225,19 +204,17 @@ def flatten_location_services(payload: dict) -> pd.DataFrame:
             "trainIdentity": (s.get("trainIdentity") or "").strip(),
             "serviceUid": s.get("serviceUid"),
             "runDate": s.get("runDate"),
-            "atocName": s.get("atocName"),
+            "atocName": s.get("atocName") or "",
             "plannedCancel": bool(s.get("plannedCancel", False)),
             "gbttBookedDeparture": ld.get("gbttBookedDeparture"),
         })
     return pd.DataFrame(rows)
-
 
 def rtt_service_detail(service_uid: str, run_date_iso: str, auth: HTTPBasicAuth) -> dict:
     url = f"{RTT_BASE}/json/service/{service_uid}/{run_date_iso}"
     r = requests.get(url, auth=auth, timeout=30)
     r.raise_for_status()
     return r.json()
-
 
 def extract_origin_dest_times_from_detail(payload: dict) -> dict:
     locs = payload.get("locations", []) or []
@@ -263,355 +240,407 @@ def extract_origin_dest_times_from_detail(payload: dict) -> dict:
     }
 
 
-# ----------------------------
-# Matching structures
-# ----------------------------
-@dataclass
-class ExpectedService:
-    headcode: str
-    origin_name: str
-    dest_name: str
-    dep_hhmm: Optional[str]
-    arr_hhmm: Optional[str]
-    origin_crs: Optional[str]
-    dest_crs: Optional[str]
-    diagram_id: str
+# -------------------------
+# App
+# -------------------------
+st.set_page_config(page_title="RTT No-Brand Checker", layout="wide")
+st.title("RTT No-Brand Checker")
+st.caption("Checks PASS trips where Brand is blank. Expected run dates are derived from selected date range + JourneyDays Run railway day codes.")
 
-
-# ----------------------------
-# Streamlit UI
-# ----------------------------
-st.set_page_config(page_title="No-Brand RTT Checker", layout="wide")
-st.title("No-Brand RTT Checker")
-st.caption("Checks services where Brand is blank. Validates Headcode + From/To + booked dep/arr on eligible dates.")
-
-with st.sidebar:
-    st.header("1) Upload files")
-    pass_trips_file = st.file_uploader("Upload pass-trips.csv", type=["csv"])
-    rail_refs_file = st.file_uploader("Upload RailReferences.csv (optional but recommended)", type=["csv"])
-
-    st.header("2) Select date range")
-    today = dt.date.today()
-    date_from = st.date_input("From", value=today)
-    date_to = st.date_input("To", value=today + dt.timedelta(days=7))
-
-    st.header("3) Rules")
-    use_diagram_window = st.checkbox("Use Diagram Start/End as guardrail", value=True)
-    tol = st.selectbox("Time tolerance (minutes)", options=[0, 1, 2, 3, 5], index=0)
-
-    st.header("4) Run")
-    run_btn = st.button("Run check", type="primary")
-
-# Credentials from Streamlit secrets
+# RTT creds (from secrets)
 rtt_user = st.secrets.get("RTT_USER", "")
 rtt_pass = st.secrets.get("RTT_PASS", "")
 auth = HTTPBasicAuth(rtt_user, rtt_pass) if rtt_user and rtt_pass else None
+if not auth:
+    st.warning("RTT credentials missing. Add RTT_USER and RTT_PASS in Streamlit Cloud → App Settings → Secrets.")
 
-if not pass_trips_file:
+with st.sidebar:
+    st.header("1) Date range")
+    today = dt.date.today()
+    date_from = st.date_input("From", value=today)
+    date_to = st.date_input("To", value=today + dt.timedelta(days=7))
+    if date_to < date_from:
+        date_from, date_to = date_to, date_from
+
+    st.header("2) Options")
+    allow_30s = st.checkbox("Allow time tolerance (±30 seconds)", value=False)
+
+    st.header("3) RailReferences")
+    st.caption("Loaded once by default. Tick to upload an updated copy.")
+    update_refs = st.checkbox("Update RailReferences now", value=False)
+
+    st.header("4) Upload pass-trips.csv")
+    pass_file = st.file_uploader("pass-trips.csv", type=["csv"])
+
+# Load RailReferences
+# Put RailReferences.csv in your repo root (same folder as app.py).
+DEFAULT_RAILREFS_PATH = "RailReferences.csv"
+
+rail_refs = None
+if update_refs:
+    uploaded_refs = st.file_uploader("Upload RailReferences.csv (override)", type=["csv"], key="railrefs_uploader")
+    if uploaded_refs:
+        rail_refs = load_railrefs_from_upload(uploaded_refs)
+        st.success("Using uploaded RailReferences.csv for this session.")
+    else:
+        st.info("Ticked update, but no file uploaded yet.")
+        st.stop()
+else:
+    try:
+        rail_refs = load_railrefs_from_path(DEFAULT_RAILREFS_PATH)
+    except Exception as e:
+        st.error(f"Couldn't load default RailReferences.csv from repo path '{DEFAULT_RAILREFS_PATH}'. Upload it using the update option. Details: {e}")
+        st.stop()
+
+desc_to_crs = build_desc_to_crs(rail_refs)
+
+if not pass_file:
     st.info("Upload pass-trips.csv to begin.")
     st.stop()
 
-df = load_pass_trips(pass_trips_file)
+# Load pass-trips (always metadata first 3 rows, headers on row 4)
+df = pd.read_csv(pass_file, skiprows=3)
 
-with st.expander("Debug: detected columns from pass-trips.csv"):
+with st.expander("Debug: detected columns in pass-trips.csv"):
     st.write(list(df.columns))
 
-if rail_refs_file:
-    rail_refs = load_rail_refs(rail_refs_file)
-    desc_to_crs = build_desc_to_crs(rail_refs)
-    st.success("Using uploaded RailReferences.csv")
-else:
-    desc_to_crs = {}
-    st.warning("RailReferences.csv not uploaded. Origin CRS mapping may fail; upload it for best results.")
-
-# Required columns (loose-match)
+# Detect needed columns (loose matching)
 col_brand = find_col(df, "Brand")
 col_headcode = find_col(df, "Headcode")
-col_origin = find_col(df, "JourneyOrigin") or find_col(df, "Journey Origin") or find_col(df, "Origin")
-col_dest = find_col(df, "JourneyDestination") or find_col(df, "Journey Destination") or find_col(df, "Destination")
-col_dep = find_col(df, "JourneyDeparture") or find_col(df, "Journey Departure") or find_col(df, "Departure")
-col_arr = find_col(df, "JourneyArrival") or find_col(df, "Journey Arrival") or find_col(df, "Arrival")
-col_start = find_col(df, "DiagramStart Date") or find_col(df, "Diagram Start Date") or find_col(df, "Start Date")
-col_end = find_col(df, "DiagramEnd Date") or find_col(df, "Diagram End Date") or find_col(df, "End Date")
-col_days = find_col(df, "Diagram Days Run") or find_col(df, "Days Run") or find_col(df, "DaysRun")
-col_diagram_id = find_col(df, "DiagramID") or find_col(df, "Diagram Id") or find_col(df, "Diagram ID")
+col_origin = find_col(df, "JourneyOrigin", "Journey Origin", "Origin")
+col_dest = find_col(df, "JourneyDestination", "Journey Destination", "Destination")
+col_dep = find_col(df, "JourneyDeparture", "Journey Departure", "Departure")
+col_arr = find_col(df, "JourneyArrival", "Journey Arrival", "Arrival")
+col_jdays = find_col(df, "JourneyDays Run", "Journey Days Run", "JourneyDaysRun", "JourneyDays")
+# diagram info columns for reporting
+col_resource = find_col(df, "Resource")
+col_plan_type = find_col(df, "DiagramPlan Type", "Diagram Plan Type", "Plan Type")
+col_depot = find_col(df, "DiagramDepot", "Diagram Depot", "Depot")
+col_did = find_col(df, "DiagramID", "Diagram Id", "Diagram ID")
+col_ddays = find_col(df, "DiagramDays Run", "Diagram Days Run", "DiagramDaysRun")
 
-missing = [name for name, col in {
+required = {
     "Brand": col_brand,
     "Headcode": col_headcode,
-    "Journey origin": col_origin,
-    "Journey destination": col_dest,
-    "Journey departure": col_dep,
-    "Journey arrival": col_arr,
-    "Diagram start date": col_start,
-    "Diagram end date": col_end,
-    "Diagram days run": col_days,
-}.items() if col is None]
-
-with st.expander("Debug: column mapping used by the app"):
+    "JourneyOrigin": col_origin,
+    "JourneyDestination": col_dest,
+    "JourneyDeparture": col_dep,
+    "JourneyArrival": col_arr,
+    "JourneyDays Run": col_jdays,
+}
+missing = [k for k, v in required.items() if v is None]
+with st.expander("Debug: column mapping used"):
     st.write({
-        "Brand": col_brand,
-        "Headcode": col_headcode,
-        "JourneyOrigin": col_origin,
-        "JourneyDestination": col_dest,
-        "JourneyDeparture": col_dep,
-        "JourneyArrival": col_arr,
-        "DiagramStart Date": col_start,
-        "DiagramEnd Date": col_end,
-        "Diagram Days Run": col_days,
-        "DiagramID": col_diagram_id,
+        **required,
+        "Resource": col_resource,
+        "DiagramPlan Type": col_plan_type,
+        "DiagramDepot": col_depot,
+        "DiagramID": col_did,
+        "DiagramDays Run": col_ddays,
     })
 
 if missing:
-    st.error(
-        "I couldn't find these required columns in your pass-trips.csv: "
-        + ", ".join(missing)
-        + ".\n\nOpen the Debug columns expander above and tell me the closest column names."
-    )
+    st.error("Missing required columns: " + ", ".join(missing) + ". Check the Debug columns expander above.")
     st.stop()
 
-# Filter: Brand blank
-df["Brand_missing"] = df[col_brand].isna() | (df[col_brand].astype(str).str.strip() == "")
-df_nb = df[df["Brand_missing"]].copy()
+# Filter to Brand blank only
+df_nb = df[df[col_brand].isna() | (df[col_brand].astype(str).str.strip() == "")].copy()
 
-# Parse fields
-df_nb["DiagramStart_dt"] = df_nb[col_start].apply(parse_ddmmyyyy)
-df_nb["DiagramEnd_dt"] = df_nb[col_end].apply(parse_ddmmyyyy)
+# Pre-parse fields
 df_nb["dep_hhmm"] = df_nb[col_dep].apply(parse_hhmm)
 df_nb["arr_hhmm"] = df_nb[col_arr].apply(parse_hhmm)
-df_nb["days_set"] = df_nb[col_days].apply(parse_days_run)
+df_nb["jdays_set"] = df_nb[col_jdays].apply(parse_journey_days_run)
 
-df_nb["origin_crs"] = df_nb[col_origin].apply(lambda x: desc_to_crs.get(norm(x)) if desc_to_crs else None)
-df_nb["dest_crs"] = df_nb[col_dest].apply(lambda x: desc_to_crs.get(norm(x)) if desc_to_crs else None)
+df_nb["origin_crs"] = df_nb[col_origin].apply(lambda x: desc_to_crs.get(norm(x)))
+df_nb["dest_crs"] = df_nb[col_dest].apply(lambda x: desc_to_crs.get(norm(x)))
 
-st.subheader("Rows considered (Brand blank)")
-st.write(f"Rows: **{len(df_nb)}** | Unique headcodes: **{df_nb[col_headcode].nunique()}**")
+st.subheader("Input summary (Brand blank only)")
+st.write(f"Rows with Brand blank: **{len(df_nb)}** | Unique headcodes: **{df_nb[col_headcode].nunique()}**")
 
-with st.expander("Preview filtered input rows"):
-    preview_cols = [col_headcode, col_origin, col_dest, col_dep, col_arr, col_start, col_end, col_days]
-    if col_diagram_id:
-        preview_cols.append(col_diagram_id)
-    extra = ["origin_crs", "dest_crs", "dep_hhmm", "arr_hhmm"]
-    st.dataframe(df_nb[preview_cols + extra], use_container_width=True)
+with st.expander("Preview (Brand blank only)"):
+    show_cols = [col_headcode, col_origin, col_dest, col_dep, col_arr, col_jdays]
+    for c in [col_resource, col_plan_type, col_depot, col_did, col_ddays]:
+        if c:
+            show_cols.append(c)
+    show_cols = list(dict.fromkeys(show_cols))
+    st.dataframe(df_nb[show_cols + ["origin_crs", "dest_crs", "dep_hhmm", "arr_hhmm"]], use_container_width=True)
 
-if not run_btn:
-    st.stop()
+with st.expander("Debug: JourneyDays Run values (top 30)"):
+    st.write(df_nb[col_jdays].astype(str).value_counts().head(30))
 
-if auth is None:
-    st.error("RTT credentials not configured. Add RTT_USER and RTT_PASS in Streamlit Cloud Secrets.")
-    st.stop()
-
-# Build expected services per date within user-selected range
-date_from = min(date_from, date_to)
-date_to = max(date_from, date_to)
-
-expected_by_date: Dict[dt.date, List[ExpectedService]] = {}
+# Build expected services by date based on selected range + JourneyDays Run
+expected_rows: List[dict] = []
 for d in daterange(date_from, date_to):
-    dc = dow_code(d)
-    subset = df_nb[df_nb["days_set"].apply(lambda s: dc in s if isinstance(s, set) else False)].copy()
-
-    if use_diagram_window:
-        subset = subset[
-            subset.apply(
-                lambda r: (r["DiagramStart_dt"] is None or d >= r["DiagramStart_dt"]) and
-                          (r["DiagramEnd_dt"] is None or d <= r["DiagramEnd_dt"]),
-                axis=1
-            )
-        ]
-
-    exp_list: List[ExpectedService] = []
-    for _, r in subset.iterrows():
-        exp_list.append(
-            ExpectedService(
-                headcode=str(r[col_headcode]).strip(),
-                origin_name=str(r[col_origin]).strip(),
-                dest_name=str(r[col_dest]).strip(),
-                dep_hhmm=r["dep_hhmm"],
-                arr_hhmm=r["arr_hhmm"],
-                origin_crs=r.get("origin_crs"),
-                dest_crs=r.get("dest_crs"),
-                diagram_id=str(r[col_diagram_id]).strip() if col_diagram_id else "",
-            )
-        )
-    expected_by_date[d] = exp_list
-
-total_expected = sum(len(v) for v in expected_by_date.values())
-
-st.subheader("Expected checks in selected date range")
-st.write(f"Date range: **{date_from} → {date_to}** | Expected service-checks: **{total_expected}**")
-
-@st.cache_data(ttl=300)
-def cached_location_search(origin: str, d: dt.date, user: str, pw: str) -> dict:
-    a = HTTPBasicAuth(user, pw)
-    return rtt_location_services(origin, d, a)
-
-def check_one(expected: ExpectedService, d: dt.date, origin_services: pd.DataFrame) -> Tuple[bool, str, bool, str]:
-    headcode = expected.headcode
-    dep = expected.dep_hhmm
-
-    candidates = origin_services[origin_services["trainIdentity"] == headcode].copy()
-    if candidates.empty:
-        return False, "Headcode not found at origin on date", False, ""
-
-    # departure time at origin
-    if dep:
-        candidates["dep_ok"] = candidates["gbttBookedDeparture"].apply(lambda t: within_tolerance(dep, t, tol))
-        candidates = candidates[candidates["dep_ok"] == True]
-        if candidates.empty:
-            return False, "Headcode found but departure time differs", False, ""
-
-    cand = candidates.iloc[0]
-    uid = cand.get("serviceUid")
-    run_date_iso = cand.get("runDate")
-    planned_cancel = bool(cand.get("plannedCancel", False))
-    atoc_name = cand.get("atocName") or ""
-
-    if not uid or not run_date_iso:
-        return False, "Insufficient RTT data to verify destination/arrival", planned_cancel, atoc_name
-
-    try:
-        detail = rtt_service_detail(uid, run_date_iso, auth)
-        det = extract_origin_dest_times_from_detail(detail)
-    except Exception:
-        return False, "RTT service detail lookup failed", planned_cancel, atoc_name
-
-    # destination name check (soft but effective)
-    if expected.dest_name and det.get("dest_name"):
-        expn = norm(expected.dest_name)
-        actn = norm(det["dest_name"])
-        if expn not in actn and actn not in expn:
-            return False, f"Destination differs (RTT: {det.get('dest_name')})", planned_cancel, atoc_name
-
-    # arrival time check
-    exp_arr = expected.arr_hhmm
-    rtt_arr = det.get("book_arr")
-    if exp_arr and rtt_arr:
-        if not within_tolerance(exp_arr, rtt_arr, tol):
-            return False, f"Arrival time differs (RTT: {rtt_arr})", planned_cancel, atoc_name
-
-    return True, "Matched", planned_cancel, atoc_name
-
-report_rows = []
-done = 0
-progress = st.progress(0) if total_expected > 0 else None
-
-for d, exp_list in expected_by_date.items():
-    if not exp_list:
+    wd = d.weekday()  # Mon=0..Sun=6
+    day_subset = df_nb[df_nb["jdays_set"].apply(lambda s: wd in s if isinstance(s, set) else False)]
+    if day_subset.empty:
         continue
 
-    by_origin: Dict[str, List[ExpectedService]] = {}
-    unmapped: List[ExpectedService] = []
-
-    for e in exp_list:
-        if e.origin_crs:
-            by_origin.setdefault(e.origin_crs, []).append(e)
+    for _, r in day_subset.iterrows():
+        # Diagram string for reporting (your required format)
+        diagram_str_parts = []
+        if col_resource: diagram_str_parts.append(str(r.get(col_resource, "")).strip())
+        if col_plan_type: diagram_str_parts.append(str(r.get(col_plan_type, "")).strip())
+        depot = str(r.get(col_depot, "")).strip() if col_depot else ""
+        did = str(r.get(col_did, "")).strip() if col_did else ""
+        ddays = str(r.get(col_ddays, "")).strip() if col_ddays else ""
+        # Format exactly: "Resource" - "DiagramPlan Type" "DiagramDepot"."DiagramID" "DiagramDays Run"
+        diagram_info = ""
+        if diagram_str_parts:
+            resource = diagram_str_parts[0]
+            plan = diagram_str_parts[1] if len(diagram_str_parts) > 1 else ""
+            diagram_info = f'{resource} - {plan} {depot}.{did} {ddays}'.strip()
         else:
-            unmapped.append(e)
+            diagram_info = f'{depot}.{did} {ddays}'.strip()
 
-    for e in unmapped:
-        report_rows.append({
-            "date": d.isoformat(),
-            "headcode": e.headcode,
-            "from": e.origin_name,
-            "to": e.dest_name,
-            "dep": e.dep_hhmm,
-            "arr": e.arr_hhmm,
-            "status": "NOT CHECKED",
-            "reason": "Origin CRS not mapped (upload RailReferences.csv or add alias)",
-            "planned_cancel": "",
-            "operator": "",
-            "diagram_id": e.diagram_id,
+        expected_rows.append({
+            "date": d,
+            "weekday": WEEKDAY_NAMES[wd],
+            "headcode": str(r[col_headcode]).strip(),
+            "from": str(r[col_origin]).strip(),
+            "to": str(r[col_dest]).strip(),
+            "dep": r["dep_hhmm"],
+            "arr": r["arr_hhmm"],
+            "origin_crs": r["origin_crs"],
+            "dest_crs": r["dest_crs"],
+            "diagram_info": diagram_info,
         })
-        done += 1
-        if progress:
-            progress.progress(min(1.0, done / max(1, total_expected)))
 
-    for origin_crs, services in by_origin.items():
-        try:
-            payload = cached_location_search(origin_crs, d, rtt_user, rtt_pass)
-            origin_services = flatten_location_services(payload)
-        except Exception as ex:
-            for e in services:
-                report_rows.append({
-                    "date": d.isoformat(),
-                    "headcode": e.headcode,
-                    "from": e.origin_name,
-                    "to": e.dest_name,
-                    "dep": e.dep_hhmm,
-                    "arr": e.arr_hhmm,
-                    "status": "FAIL",
-                    "reason": f"RTT location query failed: {ex}",
-                    "planned_cancel": "",
-                    "operator": "",
-                    "diagram_id": e.diagram_id,
-                })
-                done += 1
-                if progress:
-                    progress.progress(min(1.0, done / max(1, total_expected)))
-            continue
+expected = pd.DataFrame(expected_rows)
 
-        for e in services:
-            ok, reason, planned_cancel, atoc_name = check_one(e, d, origin_services)
-            report_rows.append({
-                "date": d.isoformat(),
-                "headcode": e.headcode,
-                "from": e.origin_name,
-                "to": e.dest_name,
-                "dep": e.dep_hhmm,
-                "arr": e.arr_hhmm,
-                "status": "OK" if ok else "FAIL",
-                "reason": "" if ok else reason,
-                "planned_cancel": "Y" if planned_cancel else "",
-                "operator": atoc_name,
-                "diagram_id": e.diagram_id,
+st.subheader("Expected services in selected date range")
+st.write(f"Date range: **{date_from} → {date_to}** | Expected checks: **{len(expected)}**")
+
+if expected.empty:
+    st.warning("No expected services found for that date range using JourneyDays Run. Widen the range or check JourneyDays Run values.")
+    st.stop()
+
+# Run check button
+run = st.button("Run RTT check", type="primary")
+if not run:
+    st.stop()
+
+if not auth:
+    st.error("RTT credentials are missing. Add RTT_USER/RTT_PASS in Streamlit Cloud Secrets.")
+    st.stop()
+
+# Cache RTT location searches
+@st.cache_data(ttl=300)
+def cached_location(crs: str, d: dt.date, user: str, pw: str) -> dict:
+    return rtt_location_services(crs, d, HTTPBasicAuth(user, pw))
+
+results: List[dict] = []
+progress = st.progress(0)
+total = len(expected)
+done = 0
+
+# Group by (date, origin_crs) to minimise RTT calls
+expected["date_iso"] = expected["date"].apply(lambda x: x.isoformat())
+groups = expected.groupby(["date_iso", "origin_crs"], dropna=False)
+
+for (date_iso, origin_crs), grp in groups:
+    run_date = dt.date.fromisoformat(date_iso)
+
+    # If we can't map CRS, mark as not checked
+    if not isinstance(origin_crs, str) or not origin_crs.strip():
+        for _, row in grp.iterrows():
+            results.append({
+                **row.to_dict(),
+                "status": "NOT CHECKED",
+                "error": "Origin CRS not mapped (check RailReferences or add alias)",
+                "operator": "",
+                "planned_cancel": "",
             })
             done += 1
-            if progress:
-                progress.progress(min(1.0, done / max(1, total_expected)))
+            progress.progress(min(1.0, done / total))
+        continue
 
-if progress:
-    progress.empty()
+    # Fetch RTT for this origin/date
+    try:
+        payload = cached_location(origin_crs.strip(), run_date, rtt_user, rtt_pass)
+        loc_df = flatten_location_services(payload)
+    except Exception as ex:
+        for _, row in grp.iterrows():
+            results.append({
+                **row.to_dict(),
+                "status": "FAIL",
+                "error": f"RTT location query failed: {ex}",
+                "operator": "",
+                "planned_cancel": "",
+            })
+            done += 1
+            progress.progress(min(1.0, done / total))
+        continue
 
-report = pd.DataFrame(report_rows)
+    # Check each expected row
+    for _, row in grp.iterrows():
+        hc = str(row["headcode"]).strip()
+        exp_dep = row["dep"]
+        exp_arr = row["arr"]
+        exp_to = row["to"]
 
-fails = report[report["status"] == "FAIL"]
-oks = report[report["status"] == "OK"]
-not_checked = report[report["status"] == "NOT CHECKED"]
+        candidates = loc_df[loc_df["trainIdentity"] == hc].copy()
+        if candidates.empty:
+            results.append({
+                **row.to_dict(),
+                "status": "FAIL",
+                "error": "Headcode not found at origin on date",
+                "operator": "",
+                "planned_cancel": "",
+            })
+            done += 1
+            progress.progress(min(1.0, done / total))
+            continue
 
-st.subheader("Result summary")
-st.write(f"OK: **{len(oks)}** | FAIL: **{len(fails)}** | Not checked: **{len(not_checked)}**")
+        # Departure match at origin
+        if exp_dep:
+            candidates["dep_ok"] = candidates["gbttBookedDeparture"].apply(lambda t: within_30_seconds(exp_dep, t, allow_30s))
+            candidates = candidates[candidates["dep_ok"] == True]
+            if candidates.empty:
+                results.append({
+                    **row.to_dict(),
+                    "status": "FAIL",
+                    "error": "Headcode found but departure time differs",
+                    "operator": "",
+                    "planned_cancel": "",
+                })
+                done += 1
+                progress.progress(min(1.0, done / total))
+                continue
 
-def format_line(r) -> str:
-    ddmmyyyy = dt.date.fromisoformat(r["date"]).strftime("%d/%m/%Y")
-    return f"{r['headcode']}: {r['dep']} {r['from']} - {r['to']} {r['arr']} on {ddmmyyyy}"
+        # Use first candidate and confirm destination + arrival via service detail
+        cand = candidates.iloc[0]
+        uid = cand.get("serviceUid")
+        rtt_run_date = cand.get("runDate")
+        op = cand.get("atocName") or ""
+        pc = "Y" if bool(cand.get("plannedCancel", False)) else ""
 
-st.markdown("### Daily-style report")
-if len(fails) == 0 and len(not_checked) == 0:
-    st.success("All services found to be running!")
-    st.write("The following services were checked and running as expected:")
-    for _, r in oks.sort_values(["date", "dep", "headcode"]).iterrows():
-        st.write(f"- {format_line(r)}")
+        if not uid or not rtt_run_date:
+            results.append({
+                **row.to_dict(),
+                "status": "FAIL",
+                "error": "Insufficient RTT data to verify destination/arrival",
+                "operator": op,
+                "planned_cancel": pc,
+            })
+            done += 1
+            progress.progress(min(1.0, done / total))
+            continue
+
+        try:
+            detail = rtt_service_detail(uid, rtt_run_date, auth)
+            det = extract_origin_dest_times_from_detail(detail)
+        except Exception:
+            results.append({
+                **row.to_dict(),
+                "status": "FAIL",
+                "error": "RTT service detail lookup failed",
+                "operator": op,
+                "planned_cancel": pc,
+            })
+            done += 1
+            progress.progress(min(1.0, done / total))
+            continue
+
+        # Destination name check (soft match)
+        det_dest = det.get("dest_name") or ""
+        if exp_to and det_dest:
+            if norm(exp_to) not in norm(det_dest) and norm(det_dest) not in norm(exp_to):
+                results.append({
+                    **row.to_dict(),
+                    "status": "FAIL",
+                    "error": f"Destination differs (RTT: {det_dest})",
+                    "operator": op,
+                    "planned_cancel": pc,
+                })
+                done += 1
+                progress.progress(min(1.0, done / total))
+                continue
+
+        # Arrival time check at destination
+        rtt_arr = det.get("book_arr")
+        if exp_arr and rtt_arr:
+            if not within_30_seconds(exp_arr, rtt_arr, allow_30s):
+                results.append({
+                    **row.to_dict(),
+                    "status": "FAIL",
+                    "error": f"Arrival time differs (RTT: {rtt_arr})",
+                    "operator": op,
+                    "planned_cancel": pc,
+                })
+                done += 1
+                progress.progress(min(1.0, done / total))
+                continue
+
+        # OK
+        results.append({
+            **row.to_dict(),
+            "status": "OK",
+            "error": "",
+            "operator": op,
+            "planned_cancel": pc,
+        })
+        done += 1
+        progress.progress(min(1.0, done / total))
+
+progress.empty()
+
+report = pd.DataFrame(results)
+
+ok = report[report["status"] == "OK"]
+fail = report[report["status"] == "FAIL"]
+nc = report[report["status"] == "NOT CHECKED"]
+
+st.subheader("Outcome")
+st.write(f"Checked: **{len(report)}** | OK: **{len(ok)}** | Errors: **{len(fail)}** | Not checked: **{len(nc)}**")
+
+# Info message as requested
+if len(fail) == 0 and len(nc) == 0:
+    st.success("All trains are running as booked for the selected date range (based on RTT checks).")
 else:
-    st.error("Some services did not match.")
-    if len(oks) > 0:
-        st.write("**Matched:**")
-        for _, r in oks.sort_values(["date", "dep", "headcode"]).iterrows():
-            st.write(f"- {format_line(r)}")
-    if len(fails) > 0:
-        st.write("**Not matched / differences:**")
-        for _, r in fails.sort_values(["date", "dep", "headcode"]).iterrows():
-            st.write(f"- {format_line(r)} — {r['reason']}")
-    if len(not_checked) > 0:
-        st.write("**Not checked:**")
-        for _, r in not_checked.sort_values(["date", "dep", "headcode"]).iterrows():
-            st.write(f"- {format_line(r)} — {r['reason']}")
+    st.error("Some trains are NOT running as booked, or could not be checked. You can export a CSV report with details.")
 
-st.subheader("Detailed table")
-st.dataframe(report.sort_values(["date", "status", "dep", "headcode"]), use_container_width=True)
+# Simplified list for OK trains
+with st.expander("Trains running as booked (simplified)"):
+    simp = ok.copy()
+    simp["line"] = simp.apply(lambda r: f"{r['headcode']} {r['dep']} {r['from']} - {r['to']} {r['arr']} ({r['date_iso']})", axis=1)
+    st.write("\n".join(simp.sort_values(["date_iso", "dep", "headcode"])["line"].tolist()) or "None")
 
-st.download_button(
-    "Download report as CSV",
-    data=report.to_csv(index=False).encode("utf-8"),
-    file_name=f"rtt_no_brand_report_{date_from}_{date_to}.csv",
-    mime="text/csv",
-)
+# Errors list
+with st.expander("Errors / not checked (details)"):
+    if report[(report["status"] != "OK")].empty:
+        st.write("None")
+    else:
+        st.dataframe(
+            report[report["status"] != "OK"][[
+                "date_iso", "headcode", "from", "to", "dep", "arr", "status", "error", "diagram_info", "operator", "planned_cancel"
+            ]].sort_values(["date_iso", "status", "dep", "headcode"]),
+            use_container_width=True
+        )
+
+# Ask user if they want CSV report
+st.subheader("CSV report")
+create_csv = st.checkbox("Create CSV report", value=False)
+
+if create_csv:
+    # Build CSV output:
+    # - OK rows: simplified info
+    # - FAIL/NOT CHECKED: include error + diagram_info
+    out = report.copy()
+    out["date"] = out["date_iso"]
+    out["diagram"] = out["diagram_info"]
+
+    # Simplify OK
+    out.loc[out["status"] == "OK", "error"] = ""
+
+    cols_out = [
+        "date", "headcode", "from", "to", "dep", "arr", "status",
+        "error", "diagram", "operator", "planned_cancel"
+    ]
+    csv_bytes = out[cols_out].to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "Download CSV report",
+        data=csv_bytes,
+        file_name=f"rtt_no_brand_report_{date_from}_{date_to}.csv",
+        mime="text/csv",
+    )
