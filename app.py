@@ -343,7 +343,7 @@ def reset_run_state():
 
 
 with st.sidebar:
-    st.header("Steps")
+    st.header("New search?")
     clear_btn = st.button("Clear previous results", use_container_width=True)
     if clear_btn:
         reset_run_state()
