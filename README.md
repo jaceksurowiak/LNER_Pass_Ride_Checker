@@ -1,2 +1,2 @@
-# rtt-no-brand-checker
-Checks RTT services with no brand ID against diagrams
+# LNER (TRENT) - PASS RIDE CHECKER
+Uses the raw pass-trips.csv file to check whether other operators’ trains are running as diagrammed. The app will confirm which trains are running as booked and, where checks are possible, will highlight any errors found. If there are location-related issues (for example, a station not matching the RailReferences file), you can upload an updated RailReferences file. The app provides a visual report and you can also export a CSV for your records.
