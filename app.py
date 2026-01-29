@@ -319,10 +319,10 @@ def cached_location_search(crs: str, run_date: dt.date, user: str, pw: str) -> d
 st.set_page_config(page_title="LNER (TRENT) - PASS RIDE CHECKER", layout="wide")
 st.title("LNER (TRENT) - PASS RIDE CHECKER")
 st.caption(
-    "Usses raw pass-trips.csv file and check other operators' trains if they are running as per what is diagrammed.\n"
-    "The app will notify if trains are running as booked, and if the app is able to check, then if there are any errors reported.\n"
-    "If there are issues related to location (not matching in the RailReferences file, new - updated file could be uploaded.\n"
-    "App create visual report, and you can create csv file for your record."
+    "Uses the raw pass-trips.csv file to check whether other operators’ trains are running as diagrammed.\n"
+    "The app will confirm which trains are running as booked and, where checks are possible, will highlight any errors found.\n"
+    "If there are location-related issues (for example, a station not matching the RailReferences file), you can upload an updated RailReferences file.\n"
+    "The app provides a visual report and you can also export a CSV for your records."
 )
 
 # RTT credentials via Streamlit Secrets
