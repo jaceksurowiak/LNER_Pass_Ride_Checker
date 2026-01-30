@@ -362,7 +362,7 @@ with st.sidebar:
         date_from, date_to = date_to, date_from
 
     st.subheader("3) RailReferences (optional)")
-    st.caption("Loaded from repo by default. Tick to upload an updated file.")
+    st.caption("Loaded by default. Tick to upload an updated file.")
     update_refs = st.checkbox("Upload updated RailReferences.csv", value=False)
     uploaded_refs = None
     if update_refs:
