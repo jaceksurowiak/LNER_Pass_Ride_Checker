@@ -7,7 +7,7 @@ import requests
 import streamlit as st
 from requests.auth import HTTPBasicAuth
 
-RTT_BASE = "secure.realtimetrains.co.uk/api/"
+RTT_BASE = "secure.realtimetrains.co.uk/api"
 
 
 # ----------------------------
