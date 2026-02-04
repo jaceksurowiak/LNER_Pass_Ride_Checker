@@ -9,20 +9,17 @@ from requests.auth import HTTPBasicAuth
 
 RTT_BASE = "https://secure.realtimetrains.co.uk/api"
 
-
 # ----------------------------
 # Helpers
 # ----------------------------
 def key(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(s).strip().lower())
 
-
 def norm_name(s: str) -> str:
     s = str(s).strip().lower()
     s = re.sub(r"[^a-z0-9 ]+", "", s)
     s = re.sub(r"\s+", " ", s)
     return s
-
 
 def find_col(df: pd.DataFrame, *candidates: str, allow_contains: bool = True) -> Optional[str]:
     cols = list(df.columns)
@@ -44,7 +41,6 @@ def find_col(df: pd.DataFrame, *candidates: str, allow_contains: bool = True) ->
 
     return None
 
-
 def parse_pass_hhmm(x) -> Optional[str]:
     if pd.isna(x):
         return None
@@ -59,7 +55,6 @@ def parse_pass_hhmm(x) -> Optional[str]:
         return f"{hh:02d}:{mm:02d}"
     return None
 
-
 def rtt_public_to_hhmm(x) -> Optional[str]:
     if x is None or (isinstance(x, float) and pd.isna(x)):
         return None
@@ -72,7 +67,6 @@ def rtt_public_to_hhmm(x) -> Optional[str]:
     if len(s) == 6:
         return f"{s[:2]}:{s[2:4]}"
     return None
-
 
 def parse_journey_days_run(value) -> Set[int]:
     if pd.isna(value):
@@ -139,16 +133,13 @@ def parse_journey_days_run(value) -> Set[int]:
         return set(range(7)) - days if days else set(range(7))
     return days
 
-
 @st.cache_data
 def load_railrefs_from_repo(path: str) -> pd.DataFrame:
     return pd.read_csv(path, header=None, names=["tiploc", "crs", "description"])
 
-
 @st.cache_data
 def load_railrefs_from_upload(uploaded) -> pd.DataFrame:
     return pd.read_csv(uploaded, header=None, names=["tiploc", "crs", "description"])
-
 
 def build_desc_to_crs(rail_refs: pd.DataFrame) -> Dict[str, str]:
     d: Dict[str, str] = {}
@@ -157,7 +148,6 @@ def build_desc_to_crs(rail_refs: pd.DataFrame) -> Dict[str, str]:
         crs = str(r["crs"]).strip().upper() if not pd.isna(r["crs"]) else ""
         if desc and crs and desc not in d:
             d[desc] = crs
-
     aliases = {
         "kings cross": "KGX",
         "london kings cross": "KGX",
@@ -169,13 +159,11 @@ def build_desc_to_crs(rail_refs: pd.DataFrame) -> Dict[str, str]:
         d.setdefault(norm_name(k), v)
     return d
 
-
 def rtt_location_services(crs_or_tiploc: str, run_date: dt.date, auth: HTTPBasicAuth) -> dict:
     url = f"{RTT_BASE}/json/search/{crs_or_tiploc}/{run_date.year}/{run_date.month:02d}/{run_date.day:02d}"
     r = requests.get(url, auth=auth, timeout=30)
     r.raise_for_status()
     return r.json()
-
 
 def flatten_location_services(payload: dict) -> pd.DataFrame:
     services = payload.get("services", []) or []
@@ -197,14 +185,12 @@ def flatten_location_services(payload: dict) -> pd.DataFrame:
         )
     return pd.DataFrame(rows)
 
-
 def rtt_service_detail(service_uid: str, run_date_iso: str, auth: HTTPBasicAuth) -> dict:
     y, m, d = str(run_date_iso).split("-")
     url = f"{RTT_BASE}/json/service/{service_uid}/{y}/{m}/{d}"
     r = requests.get(url, auth=auth, timeout=30)
     r.raise_for_status()
     return r.json()
-
 
 def extract_segment_times_by_crs(detail_payload: dict, origin_crs: str, dest_crs: str) -> dict:
     locs = detail_payload.get("locations", []) or []
@@ -242,7 +228,6 @@ def extract_segment_times_by_crs(detail_payload: dict, origin_crs: str, dest_crs
         "act_arr": rtt_public_to_hhmm(arr_raw),
     }
 
-
 @st.cache_data(ttl=300)
 def cached_location_search(crs: str, run_date: dt.date, user: str, pw: str) -> dict:
     return rtt_location_services(crs, run_date, HTTPBasicAuth(user, pw))
@@ -271,7 +256,6 @@ def reset_run_state():
         if k in st.session_state:
             del st.session_state[k]
 
-
 with st.sidebar:
     st.header("New search?")
     if st.button("Clear previous results", use_container_width=True):
@@ -293,7 +277,6 @@ with st.sidebar:
     st.subheader("3) RailReferences (optional)")
     update_refs = st.checkbox("Upload updated RailReferences.csv", value=False)
     uploaded_refs = st.file_uploader("RailReferences.csv", type=["csv"], key="railrefs_upload") if update_refs else None
-
 
 if update_refs:
     if not uploaded_refs:
