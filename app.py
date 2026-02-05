@@ -1,6 +1,6 @@
 import re
 import datetime as dt
-from typing import Optional, Dict, Set, List
+from typing import Optional, Dict, Set, List, Tuple
 
 import pandas as pd
 import requests
@@ -10,9 +10,9 @@ from requests.auth import HTTPBasicAuth
 RTT_BASE = "https://secure.realtimetrains.co.uk/api"
 
 
-# ----------------------------
+# ============================================================
 # Helpers
-# ----------------------------
+# ============================================================
 def key(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(s).strip().lower())
 
@@ -27,17 +27,21 @@ def norm_name(s: str) -> str:
 def find_col(df: pd.DataFrame, *candidates: str, allow_contains: bool = True) -> Optional[str]:
     cols = list(df.columns)
     km = {key(c): c for c in cols}
+
     for w in candidates:
         kw = key(w)
         if kw in km:
             return km[kw]
+
     if not allow_contains:
         return None
+
     for w in candidates:
         kw = key(w)
         for c in cols:
             if kw and kw in key(c):
                 return c
+
     return None
 
 
@@ -77,36 +81,74 @@ def parse_ddmmyyyy_to_date(x) -> Optional[dt.date]:
     if not s:
         return None
     try:
-        return pd.to_datetime(s, dayfirst=True).date()
+        return pd.to_datetime(s, dayfirst=True, errors="raise").date()
     except Exception:
         return None
 
 
-# ----------------------------
-# Days run parsing
-# ----------------------------
+# ============================================================
+# Rail day index mapping (YOUR REQUIREMENT)
+# Sat=1, Sun=2, Mon=3, Tue=4, Wed=5, Thu=6, Fri=7
+# ============================================================
+def rail_day_index(day: dt.date) -> int:
+    # Python weekday: Mon=0..Sun=6
+    # Convert to Sat=1..Fri=7
+    return ((day.weekday() + 2) % 7) + 1
+
+
+RAIL_ORDER = ["Saturday", "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+RAIL_BASE_MON_SAT = {1, 3, 4, 5, 6, 7}       # Sat + Mon..Fri
+RAIL_BASE_ALL_DAYS = {1, 2, 3, 4, 5, 6, 7}   # Sat..Fri (all)
+
+
+# ============================================================
+# Days run parsing -> returns rail day indexes (Sat=1..Fri=7)
+# Fix for your dataset: X patterns default to Mon–Sat base (Sunday not implied)
+# ============================================================
 def parse_journey_days_run(value) -> Set[int]:
+    """
+    Returns rail-day indexes:
+      Sat=1, Sun=2, Mon=3, Tue=4, Wed=5, Thu=6, Fri=7
+
+    Supports:
+      - Railway tokens: MO TO WO ThO FO SO Su  (Sunday explicitly via Su/SU)
+      - Compact: M T W Th F S Su, optional trailing O or X:
+          ...O => only those days
+          ...X => base days except listed days
+
+    Dataset rule:
+      - Sunday runs appear explicitly as Su rows.
+      - Therefore SX/MSX/FSX etc should NOT imply Sunday.
+    """
     if pd.isna(value):
         return set()
     raw = str(value).strip()
     if not raw:
         return set()
 
-    rail_map = {"MO": 0, "TO": 1, "WO": 2, "THO": 3, "FO": 4, "SO": 5, "SU": 6}
+    # 1) Railway tokens (MO TO WO ThO FO SO Su)
+    rail_map = {
+        "SO": 1,   # Saturday
+        "SU": 2,   # Sunday
+        "MO": 3,
+        "TO": 4,
+        "WO": 5,
+        "THO": 6,
+        "FO": 7,
+    }
     tokens = re.split(r"[,\s;/]+", raw, flags=re.IGNORECASE)
-    rail_days = set()
+    days = set()
     for t in tokens:
         t = t.strip()
         if not t:
             continue
         t_up = t.upper().replace("TH0", "THO")
-        if t_up == "SU":
-            rail_days.add(6)
-        elif t_up in rail_map:
-            rail_days.add(rail_map[t_up])
-    if rail_days:
-        return rail_days
+        if t_up in rail_map:
+            days.add(rail_map[t_up])
+    if days:
+        return days
 
+    # 2) Compact codes (no separators)
     blob = re.sub(r"[\s,;/]+", "", raw)
     if not blob:
         return set()
@@ -116,50 +158,54 @@ def parse_journey_days_run(value) -> Set[int]:
         mode = blob[-1].upper()
         blob = blob[:-1]
 
+    # If Sunday explicitly mentioned, allow full base. Otherwise base Mon–Sat only.
+    mentions_sunday = "su" in blob.lower()
+    base = RAIL_BASE_ALL_DAYS if mentions_sunday else RAIL_BASE_MON_SAT
+
     i = 0
-    days: Set[int] = set()
+    picked: Set[int] = set()
     while i < len(blob):
-        part2 = blob[i : i + 2]
-        part1 = blob[i : i + 1]
+        part2 = blob[i:i+2].lower()
+        part1 = blob[i:i+1].upper()
 
-        if part2.lower() == "th":
-            days.add(3)
+        if part2 == "th":
+            picked.add(6)   # Thu
             i += 2
             continue
-        if part2.lower() == "su":
-            days.add(6)
+        if part2 == "su":
+            picked.add(2)   # Sun
             i += 2
             continue
 
-        ch = part1.upper()
-        if ch == "M":
-            days.add(0)
-        elif ch == "T":
-            days.add(1)
-        elif ch == "W":
-            days.add(2)
-        elif ch == "F":
-            days.add(4)
-        elif ch == "S":
-            days.add(5)
+        if part1 == "M":
+            picked.add(3)
+        elif part1 == "T":
+            picked.add(4)
+        elif part1 == "W":
+            picked.add(5)
+        elif part1 == "F":
+            picked.add(7)
+        elif part1 == "S":
+            picked.add(1)   # Sat
         i += 1
 
     if mode == "O":
-        return days
+        return picked
     if mode == "X":
-        return set(range(7)) - days if days else set(range(7))
-    return days
+        return (base - picked) if picked else set(base)
+
+    return picked
 
 
-# ----------------------------
+# ============================================================
 # RailReferences
-# ----------------------------
-@st.cache_data
+# ============================================================
+@st.cache_data(show_spinner=False)
 def load_railrefs_from_repo(path: str) -> pd.DataFrame:
     return pd.read_csv(path, header=None, names=["tiploc", "crs", "description"])
 
 
-@st.cache_data
+@st.cache_data(show_spinner=False)
 def load_railrefs_from_upload(uploaded) -> pd.DataFrame:
     return pd.read_csv(uploaded, header=None, names=["tiploc", "crs", "description"])
 
@@ -184,9 +230,9 @@ def build_desc_to_crs(rail_refs: pd.DataFrame) -> Dict[str, str]:
     return d
 
 
-# ----------------------------
+# ============================================================
 # RTT calls
-# ----------------------------
+# ============================================================
 def rtt_location_services(crs_or_tiploc: str, run_date: dt.date, auth: HTTPBasicAuth) -> dict:
     url = f"{RTT_BASE}/json/search/{crs_or_tiploc}/{run_date.year}/{run_date.month:02d}/{run_date.day:02d}"
     r = requests.get(url, auth=auth, timeout=30)
@@ -225,6 +271,7 @@ def rtt_service_detail(service_uid: str, run_date_iso: str, auth: HTTPBasicAuth)
 
 def extract_segment_times_by_crs(detail_payload: dict, origin_crs: str, dest_crs: str) -> dict:
     locs = detail_payload.get("locations", []) or []
+
     origin_crs = (origin_crs or "").strip().upper()
     dest_crs = (dest_crs or "").strip().upper()
 
@@ -260,14 +307,45 @@ def extract_segment_times_by_crs(detail_payload: dict, origin_crs: str, dest_crs
     }
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=300, show_spinner=False)
 def cached_location_search(crs: str, run_date: dt.date, user: str, pw: str) -> dict:
     return rtt_location_services(crs, run_date, HTTPBasicAuth(user, pw))
 
 
-# ----------------------------
+@st.cache_data(ttl=3600, show_spinner=False)
+def cached_service_detail(service_uid: str, run_date_iso: str, user: str, pw: str) -> dict:
+    return rtt_service_detail(service_uid, run_date_iso, HTTPBasicAuth(user, pw))
+
+
+# ============================================================
+# Validity window (prevents wrong-day checks across weeks)
+# ============================================================
+def derive_validity_window(row: pd.Series) -> Tuple[Optional[dt.date], Optional[dt.date]]:
+    ts = row.get("train_start")
+    te = row.get("train_end")
+    ds = row.get("diag_start")
+    de = row.get("diag_end")
+
+    starts = [d for d in [ts, ds] if isinstance(d, dt.date)]
+    ends = [d for d in [te, de] if isinstance(d, dt.date)]
+
+    start = max(starts) if starts else None
+    end = min(ends) if ends else None
+    return start, end
+
+
+def valid_on_day(row: pd.Series, day: dt.date) -> bool:
+    start, end = derive_validity_window(row)
+    if start and day < start:
+        return False
+    if end and day > end:
+        return False
+    return True
+
+
+# ============================================================
 # App UI
-# ----------------------------
+# ============================================================
 st.set_page_config(page_title="LNER (TRENT) - PASS RIDE CHECKER", layout="wide")
 st.title("LNER (TRENT) - PASS RIDE CHECKER")
 st.caption(
@@ -280,6 +358,7 @@ st.caption(
 rtt_user = st.secrets.get("RTT_USER", "")
 rtt_pass = st.secrets.get("RTT_PASS", "")
 auth = HTTPBasicAuth(rtt_user, rtt_pass) if rtt_user and rtt_pass else None
+
 DEFAULT_RAILREFS_PATH = "RailReferences.csv"
 
 today = dt.date.today()
@@ -292,9 +371,8 @@ if "last_from" not in st.session_state:
 
 
 def reset_run_state():
-    for k in ["report", "expected", "df_nb_preview", "last_range"]:
-        if k in st.session_state:
-            del st.session_state[k]
+    for k in ["report", "expected"]:
+        st.session_state.pop(k, None)
     st.session_state["date_from"] = dt.date.today()
     st.session_state["date_to"] = dt.date.today()
     st.session_state["last_from"] = st.session_state["date_from"]
@@ -364,11 +442,16 @@ col_dest = find_col(df, "JourneyDestination", "Journey Destination", "Destinatio
 col_dep = find_col(df, "JourneyDeparture", "Journey Departure", "Departure")
 col_arr = find_col(df, "JourneyArrival", "Journey Arrival", "Arrival")
 
+# IMPORTANT: use JourneyDays Run for day logic
 col_jdays = find_col(df, "JourneyDays Run", "Journey Days Run", "JourneyDaysRun", allow_contains=False)
 
-col_dstart = find_col(df, "DiagramStart Date", "Diagram Start Date", "DiagramStartDate")
-col_dend = find_col(df, "DiagramEnd Date", "Diagram End Date", "DiagramEndDate")
+# Validity columns
+col_train_start = find_col(df, "TrainStart Date", "Train Start Date", "TrainStartDate")
+col_train_end = find_col(df, "TrainEnd Date", "Train End Date", "TrainEndDate")
+col_diag_start = find_col(df, "DiagramStart Date", "Diagram Start Date", "DiagramStartDate")
+col_diag_end = find_col(df, "DiagramEnd Date", "Diagram End Date", "DiagramEndDate")
 
+# Diagram info columns for reporting
 col_resource = find_col(df, "Resource")
 col_plan_type = find_col(df, "DiagramPlan Type", "Diagram Plan Type", "Plan Type")
 col_depot = find_col(df, "DiagramDepot", "Diagram Depot", "Depot")
@@ -389,11 +472,7 @@ for name, col in {
         missing.append(name)
 
 if missing:
-    st.error(
-        "Missing required columns: "
-        + ", ".join(missing)
-        + "\n\nNote: 'JourneyDays Run' must exist; the app will not use 'Diagram Days Run' for date logic."
-    )
+    st.error("Missing required columns: " + ", ".join(missing))
     with st.expander("Detected columns"):
         st.write(list(df.columns))
     st.stop()
@@ -403,11 +482,14 @@ df_nb = df[df[col_brand].isna() | (df[col_brand].astype(str).str.strip() == "")]
 df_nb["exp_dep"] = df_nb[col_dep].apply(parse_pass_hhmm)
 df_nb["exp_arr"] = df_nb[col_arr].apply(parse_pass_hhmm)
 df_nb["jdays_set"] = df_nb[col_jdays].apply(parse_journey_days_run)
+
 df_nb["origin_crs"] = df_nb[col_origin].apply(lambda x: desc_to_crs.get(norm_name(x)))
 df_nb["dest_crs"] = df_nb[col_dest].apply(lambda x: desc_to_crs.get(norm_name(x)))
 
-df_nb["diag_start"] = df_nb[col_dstart].apply(parse_ddmmyyyy_to_date) if col_dstart else None
-df_nb["diag_end"] = df_nb[col_dend].apply(parse_ddmmyyyy_to_date) if col_dend else None
+df_nb["train_start"] = df_nb[col_train_start].apply(parse_ddmmyyyy_to_date) if col_train_start else None
+df_nb["train_end"] = df_nb[col_train_end].apply(parse_ddmmyyyy_to_date) if col_train_end else None
+df_nb["diag_start"] = df_nb[col_diag_start].apply(parse_ddmmyyyy_to_date) if col_diag_start else None
+df_nb["diag_end"] = df_nb[col_diag_end].apply(parse_ddmmyyyy_to_date) if col_diag_end else None
 
 total_rows = len(df)
 blank_brand_rows = len(df_nb)
@@ -421,36 +503,50 @@ st.write(
 
 with st.expander("Input preview (first 200 rows)"):
     show_cols = [col_headcode, col_origin, col_dest, col_dep, col_arr, col_jdays]
-    diag_cols = [c for c in [col_resource, col_plan_type, col_depot, col_did, col_ddays, col_dstart, col_dend] if c]
+    diag_cols = [
+        c
+        for c in [
+            col_resource,
+            col_plan_type,
+            col_depot,
+            col_did,
+            col_ddays,
+            col_train_start,
+            col_train_end,
+            col_diag_start,
+            col_diag_end,
+        ]
+        if c
+    ]
     show_cols = list(dict.fromkeys(show_cols + diag_cols))
 
-    preview_cols = show_cols + ["origin_crs", "dest_crs", "exp_dep", "exp_arr", "jdays_set", "diag_start", "diag_end"]
+    preview_cols = show_cols + [
+        "origin_crs",
+        "dest_crs",
+        "exp_dep",
+        "exp_arr",
+        "jdays_set",
+        "train_start",
+        "train_end",
+        "diag_start",
+        "diag_end",
+    ]
     preview = df_nb[preview_cols].head(200)
-
     st.caption(f"Showing **{len(preview)}** row(s) (max 200) out of **{blank_brand_rows}** Brand-blank row(s).")
     st.dataframe(preview, use_container_width=True)
 
 
 # ----------------------------
-# Build expected checks
+# Build expected checks across date range
 # ----------------------------
-def valid_on_day(r: pd.Series, day: dt.date) -> bool:
-    s = r.get("diag_start")
-    e = r.get("diag_end")
-    if s and day < s:
-        return False
-    if e and day > e:
-        return False
-    return True
-
-
 expected_rows: List[dict] = []
 for i in range((date_to - date_from).days + 1):
     day = date_from + dt.timedelta(days=i)
-    wd = day.weekday()
+    rd = rail_day_index(day)  # ✅ Sat=1..Fri=7
+    wd_name = day.strftime("%A")
 
     subset = df_nb[
-        df_nb["jdays_set"].apply(lambda s: wd in s if isinstance(s, set) else False)
+        df_nb["jdays_set"].apply(lambda s: rd in s if isinstance(s, set) else False)
         & df_nb.apply(lambda r: valid_on_day(r, day), axis=1)
     ]
     if subset.empty:
@@ -472,7 +568,8 @@ for i in range((date_to - date_from).days + 1):
         expected_rows.append(
             {
                 "date": day.isoformat(),
-                "Day of the week": day.strftime("%A"),
+                "Day of the week": wd_name,
+                "Rail day index": rd,
                 "headcode": str(r[col_headcode]).strip(),
                 "exp_from": str(r[col_origin]).strip(),
                 "exp_to": str(r[col_dest]).strip(),
@@ -494,11 +591,10 @@ with st.expander("Headcodes by day (summary)"):
     if expected.empty:
         st.write("None")
     else:
-        order = ["Saturday", "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
-        st.dataframe(expected["Day of the week"].value_counts().reindex(order, fill_value=0))
+        st.dataframe(expected["Day of the week"].value_counts().reindex(RAIL_ORDER, fill_value=0))
 
 if expected.empty:
-    st.warning("No expected services found in that date range based on JourneyDays Run.")
+    st.warning("No expected services found in that date range based on JourneyDays Run and validity dates.")
     st.stop()
 
 
@@ -650,7 +746,6 @@ if run:
             cand_all["dep_pub_hhmm"] = cand_all["pub_dep_raw"].apply(rtt_public_to_hhmm)
             deps = sorted(set(cand_all["dep_pub_hhmm"].dropna().astype(str).tolist()))
             origin_rtt_deps = ", ".join(deps)
-
             ops = sorted(set(cand_all["operator"].dropna().astype(str).tolist()))
 
             candidates = cand_all
@@ -708,7 +803,7 @@ if run:
                 continue
 
             try:
-                detail = rtt_service_detail(uid, rtt_run_date, auth)
+                detail = cached_service_detail(uid, rtt_run_date, rtt_user, rtt_pass)
                 seg = extract_segment_times_by_crs(detail, row["origin_crs"], row["dest_crs"])
             except Exception as ex:
                 results.append(
@@ -870,6 +965,7 @@ st.subheader("Visual report")
 view_cols = [
     "date",
     "Day of the week",
+    "Rail day index",
     "headcode",
     "origin_crs",
     "dest_crs",
@@ -894,7 +990,7 @@ view_cols = [
 view_cols = [c for c in view_cols if c in report.columns]
 
 st.dataframe(
-    report[view_cols].sort_values(["date", "headcode", "exp_dep"], na_position="last"),
+    report[view_cols].sort_values(["date", "Rail day index", "headcode", "exp_dep"], na_position="last"),
     use_container_width=True,
 )
 
