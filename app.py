@@ -27,21 +27,17 @@ def norm_name(s: str) -> str:
 def find_col(df: pd.DataFrame, *candidates: str, allow_contains: bool = True) -> Optional[str]:
     cols = list(df.columns)
     km = {key(c): c for c in cols}
-
     for w in candidates:
         kw = key(w)
         if kw in km:
             return km[kw]
-
     if not allow_contains:
         return None
-
     for w in candidates:
         kw = key(w)
         for c in cols:
             if kw and kw in key(c):
                 return c
-
     return None
 
 
@@ -74,6 +70,21 @@ def rtt_public_to_hhmm(x) -> Optional[str]:
     return None
 
 
+def parse_ddmmyyyy_to_date(x) -> Optional[dt.date]:
+    if pd.isna(x):
+        return None
+    s = str(x).strip()
+    if not s:
+        return None
+    try:
+        return pd.to_datetime(s, dayfirst=True).date()
+    except Exception:
+        return None
+
+
+# ----------------------------
+# Days run parsing
+# ----------------------------
 def parse_journey_days_run(value) -> Set[int]:
     if pd.isna(value):
         return set()
@@ -140,6 +151,9 @@ def parse_journey_days_run(value) -> Set[int]:
     return days
 
 
+# ----------------------------
+# RailReferences
+# ----------------------------
 @st.cache_data
 def load_railrefs_from_repo(path: str) -> pd.DataFrame:
     return pd.read_csv(path, header=None, names=["tiploc", "crs", "description"])
@@ -170,6 +184,9 @@ def build_desc_to_crs(rail_refs: pd.DataFrame) -> Dict[str, str]:
     return d
 
 
+# ----------------------------
+# RTT calls
+# ----------------------------
 def rtt_location_services(crs_or_tiploc: str, run_date: dt.date, auth: HTTPBasicAuth) -> dict:
     url = f"{RTT_BASE}/json/search/{crs_or_tiploc}/{run_date.year}/{run_date.month:02d}/{run_date.day:02d}"
     r = requests.get(url, auth=auth, timeout=30)
@@ -249,7 +266,7 @@ def cached_location_search(crs: str, run_date: dt.date, user: str, pw: str) -> d
 
 
 # ----------------------------
-# App
+# App UI
 # ----------------------------
 st.set_page_config(page_title="LNER (TRENT) - PASS RIDE CHECKER", layout="wide")
 st.title("LNER (TRENT) - PASS RIDE CHECKER")
@@ -265,12 +282,13 @@ rtt_pass = st.secrets.get("RTT_PASS", "")
 auth = HTTPBasicAuth(rtt_user, rtt_pass) if rtt_user and rtt_pass else None
 DEFAULT_RAILREFS_PATH = "RailReferences.csv"
 
-
 today = dt.date.today()
 if "date_from" not in st.session_state:
     st.session_state["date_from"] = today
 if "date_to" not in st.session_state:
     st.session_state["date_to"] = today
+if "last_from" not in st.session_state:
+    st.session_state["last_from"] = st.session_state["date_from"]
 
 
 def reset_run_state():
@@ -310,6 +328,9 @@ with st.sidebar:
     uploaded_refs = st.file_uploader("RailReferences.csv", type=["csv"], key="railrefs_upload") if update_refs else None
 
 
+# ----------------------------
+# Load RailReferences
+# ----------------------------
 if update_refs:
     if not uploaded_refs:
         st.info("Upload RailReferences.csv (or untick the option).")
@@ -326,6 +347,10 @@ else:
 
 desc_to_crs = build_desc_to_crs(rail_refs)
 
+
+# ----------------------------
+# Load pass-trips.csv
+# ----------------------------
 if not pass_file:
     st.info("Upload pass-trips.csv to begin.")
     st.stop()
@@ -339,8 +364,10 @@ col_dest = find_col(df, "JourneyDestination", "Journey Destination", "Destinatio
 col_dep = find_col(df, "JourneyDeparture", "Journey Departure", "Departure")
 col_arr = find_col(df, "JourneyArrival", "Journey Arrival", "Arrival")
 
-# Strict pick: must be JourneyDays Run, never Diagram Days Run
 col_jdays = find_col(df, "JourneyDays Run", "Journey Days Run", "JourneyDaysRun", allow_contains=False)
+
+col_dstart = find_col(df, "DiagramStart Date", "Diagram Start Date", "DiagramStartDate")
+col_dend = find_col(df, "DiagramEnd Date", "Diagram End Date", "DiagramEndDate")
 
 col_resource = find_col(df, "Resource")
 col_plan_type = find_col(df, "DiagramPlan Type", "Diagram Plan Type", "Plan Type")
@@ -379,24 +406,53 @@ df_nb["jdays_set"] = df_nb[col_jdays].apply(parse_journey_days_run)
 df_nb["origin_crs"] = df_nb[col_origin].apply(lambda x: desc_to_crs.get(norm_name(x)))
 df_nb["dest_crs"] = df_nb[col_dest].apply(lambda x: desc_to_crs.get(norm_name(x)))
 
+df_nb["diag_start"] = df_nb[col_dstart].apply(parse_ddmmyyyy_to_date) if col_dstart else None
+df_nb["diag_end"] = df_nb[col_dend].apply(parse_ddmmyyyy_to_date) if col_dend else None
+
+total_rows = len(df)
+blank_brand_rows = len(df_nb)
+
 st.subheader("Input summary")
-st.write(f"Rows (Brand blank): **{len(df_nb)}** | Unique headcodes: **{df_nb[col_headcode].nunique()}**")
+st.write(
+    f"Total rows in file: **{total_rows}** | "
+    f"Rows with Brand blank: **{blank_brand_rows}** | "
+    f"Unique headcodes (Brand blank): **{df_nb[col_headcode].nunique()}**"
+)
 
 with st.expander("Input preview (first 200 rows)"):
     show_cols = [col_headcode, col_origin, col_dest, col_dep, col_arr, col_jdays]
-    diag_cols = [c for c in [col_resource, col_plan_type, col_depot, col_did, col_ddays] if c]
+    diag_cols = [c for c in [col_resource, col_plan_type, col_depot, col_did, col_ddays, col_dstart, col_dend] if c]
     show_cols = list(dict.fromkeys(show_cols + diag_cols))
-    st.dataframe(
-        df_nb[show_cols + ["origin_crs", "dest_crs", "exp_dep", "exp_arr", "jdays_set"]].head(200),
-        use_container_width=True,
-    )
+
+    preview_cols = show_cols + ["origin_crs", "dest_crs", "exp_dep", "exp_arr", "jdays_set", "diag_start", "diag_end"]
+    preview = df_nb[preview_cols].head(200)
+
+    st.caption(f"Showing **{len(preview)}** row(s) (max 200) out of **{blank_brand_rows}** Brand-blank row(s).")
+    st.dataframe(preview, use_container_width=True)
+
+
+# ----------------------------
+# Build expected checks
+# ----------------------------
+def valid_on_day(r: pd.Series, day: dt.date) -> bool:
+    s = r.get("diag_start")
+    e = r.get("diag_end")
+    if s and day < s:
+        return False
+    if e and day > e:
+        return False
+    return True
+
 
 expected_rows: List[dict] = []
 for i in range((date_to - date_from).days + 1):
     day = date_from + dt.timedelta(days=i)
     wd = day.weekday()
 
-    subset = df_nb[df_nb["jdays_set"].apply(lambda s: wd in s if isinstance(s, set) else False)]
+    subset = df_nb[
+        df_nb["jdays_set"].apply(lambda s: wd in s if isinstance(s, set) else False)
+        & df_nb.apply(lambda r: valid_on_day(r, day), axis=1)
+    ]
     if subset.empty:
         continue
 
@@ -445,6 +501,10 @@ if expected.empty:
     st.warning("No expected services found in that date range based on JourneyDays Run.")
     st.stop()
 
+
+# ----------------------------
+# Run RTT check
+# ----------------------------
 run = st.button("Run RTT check", type="primary")
 existing_report = st.session_state.get("report")
 if not run and existing_report is None:
@@ -452,7 +512,7 @@ if not run and existing_report is None:
 
 if run:
     if not auth:
-        st.error("RTT credentials missing. Add RTT_USER / RTT_PASS in Streamlit Cloud Secrets.")
+        st.error("RTT credentials missing. Add RTT_USER / RTT_PASS in Streamlit Secrets.")
         st.stop()
 
     results: List[dict] = []
@@ -786,6 +846,10 @@ if run:
 else:
     report = existing_report
 
+
+# ----------------------------
+# Output
+# ----------------------------
 if report is None or report.empty:
     st.warning("No report available. Run the check to generate one.")
     st.stop()
