@@ -599,9 +599,9 @@ if expected.empty:
 
 
 # ----------------------------
-# Run RTT check
+# Run check
 # ----------------------------
-run = st.button("Run RTT check", type="primary")
+run = st.button("Run check", type="primary")
 existing_report = st.session_state.get("report")
 if not run and existing_report is None:
     st.stop()
