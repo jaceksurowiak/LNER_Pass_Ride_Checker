@@ -207,6 +207,9 @@ def rtt_location_services(crs_or_tiploc: str, run_date: dt.date, auth: HTTPBasic
 
 
 def flatten_location_services(payload: dict) -> pd.DataFrame:
+    """
+    Location list docs: services[] contains a locationDetail object with times for that location.
+    """
     services = payload.get("services", []) or []
     rows = []
     for s in services:
@@ -237,8 +240,8 @@ def rtt_service_detail(service_uid: str, run_date_iso: str, auth: HTTPBasicAuth)
 
 def extract_segment_times_by_crs(detail_payload: dict, origin_crs: str, dest_crs: str) -> dict:
     """
-    Key fix: at the destination CRS, arrival may not be present in RTT.
-    We therefore fall back to departure at the destination to allow validation.
+    Service info docs: time fields are on each Location object (not under locationDetail).
+    Some payload variants may also include locationDetail — support both.
     """
     locs = detail_payload.get("locations", []) or []
 
@@ -253,24 +256,28 @@ def extract_segment_times_by_crs(detail_payload: dict, origin_crs: str, dest_crs
     arr_raw = None
 
     for loc in locs:
-        ld = loc.get("locationDetail") or {}
+        # Prefer locationDetail if present; otherwise use loc itself (per docs)
+        ld = loc.get("locationDetail")
+        src = ld if isinstance(ld, dict) else loc
+
         crs = (loc.get("crs") or "").strip().upper()
         desc = loc.get("description") or ""
 
         if not from_found and crs == origin_crs:
             from_found = True
             act_from = desc
-            dep_raw = ld.get("gbttBookedDeparture") or ld.get("publicTime") or ld.get("realtimeDeparture")
+            dep_raw = src.get("gbttBookedDeparture") or src.get("publicTime") or src.get("realtimeDeparture")
+
         elif from_found and not to_found and crs == dest_crs:
             to_found = True
             act_to = desc
-            # FIX: fallback to departure at TO CRS if arrival isn't available
+            # arrival may be missing; fall back to departure at the TO point
             arr_raw = (
-                ld.get("gbttBookedArrival")
-                or ld.get("publicTime")
-                or ld.get("realtimeArrival")
-                or ld.get("gbttBookedDeparture")
-                or ld.get("realtimeDeparture")
+                src.get("gbttBookedArrival")
+                or src.get("publicTime")
+                or src.get("realtimeArrival")
+                or src.get("gbttBookedDeparture")
+                or src.get("realtimeDeparture")
             )
 
     return {
@@ -519,6 +526,7 @@ for i in range((date_to - date_from).days + 1):
         diagram_set = r["ddays_set"] if isinstance(r["ddays_set"], set) else set()
         journey_set = r["jdays_set"] if isinstance(r["jdays_set"], set) else set()
 
+        # Existing behaviour: Friday diagram day + Saturday journey day => shift to next calendar day for RTT query
         shift_flag = 8 if (7 in diagram_set and 1 in journey_set) else 0
         rtt_day = day + dt.timedelta(days=1) if shift_flag == 8 else day
 
@@ -571,7 +579,7 @@ if expected.empty:
 # ----------------------------
 # Run RTT check
 # ----------------------------
-run = st.button("Run check", type="primary")
+run = st.button("Run RTT check", type="primary")
 existing_report = st.session_state.get("report")
 
 if not run and existing_report is None:
@@ -720,6 +728,7 @@ if run:
 
             ops = sorted(set(cand_all["operator"].dropna().astype(str).tolist()))
             candidates = cand_all
+
             if exp_dep:
                 candidates = candidates[candidates["dep_pub_hhmm"] == exp_dep]
                 if candidates.empty:
@@ -869,7 +878,7 @@ if run:
                 results.append(
                     {
                         **row.to_dict(),
-                        "status": "FAIL",  # or "NOT CHECKED" if you prefer
+                        "status": "FAIL",  # change to "NOT CHECKED" if you prefer
                         "error": "Arrival time not available in RTT for TO CRS (cannot validate exp_arr)",
                         "operator": op,
                         "planned_cancel": "Y" if planned_cancel else "",
