@@ -236,6 +236,10 @@ def rtt_service_detail(service_uid: str, run_date_iso: str, auth: HTTPBasicAuth)
 
 
 def extract_segment_times_by_crs(detail_payload: dict, origin_crs: str, dest_crs: str) -> dict:
+    """
+    Key fix: at the destination CRS, arrival may not be present in RTT.
+    We therefore fall back to departure at the destination to allow validation.
+    """
     locs = detail_payload.get("locations", []) or []
 
     origin_crs = (origin_crs or "").strip().upper()
@@ -260,7 +264,14 @@ def extract_segment_times_by_crs(detail_payload: dict, origin_crs: str, dest_crs
         elif from_found and not to_found and crs == dest_crs:
             to_found = True
             act_to = desc
-            arr_raw = ld.get("gbttBookedArrival") or ld.get("publicTime") or ld.get("realtimeArrival")
+            # FIX: fallback to departure at TO CRS if arrival isn't available
+            arr_raw = (
+                ld.get("gbttBookedArrival")
+                or ld.get("publicTime")
+                or ld.get("realtimeArrival")
+                or ld.get("gbttBookedDeparture")
+                or ld.get("realtimeDeparture")
+            )
 
     return {
         "from_found": from_found,
@@ -456,9 +467,32 @@ st.write(
 
 with st.expander("Input preview (first 200 rows)"):
     base_cols = [col_headcode, col_origin, col_dest, col_dep, col_arr, col_jdays]
-    diag_cols = [c for c in [col_ddays, col_resource, col_plan_type, col_depot, col_did, col_train_start, col_train_end, col_diag_start, col_diag_end] if c]
+    diag_cols = [
+        c
+        for c in [
+            col_ddays,
+            col_resource,
+            col_plan_type,
+            col_depot,
+            col_did,
+            col_train_start,
+            col_train_end,
+            col_diag_start,
+            col_diag_end,
+        ]
+        if c
+    ]
     show_cols = list(dict.fromkeys(base_cols + diag_cols))
-    preview_cols = show_cols + ["origin_crs", "dest_crs", "exp_dep", "exp_arr", "jdays_set", "ddays_set", "valid_start", "valid_end"]
+    preview_cols = show_cols + [
+        "origin_crs",
+        "dest_crs",
+        "exp_dep",
+        "exp_arr",
+        "jdays_set",
+        "ddays_set",
+        "valid_start",
+        "valid_end",
+    ]
     preview = df_nb[preview_cols].head(200)
     st.caption(f"Showing **{len(preview)}** row(s) (max 200) out of **{blank_brand_rows}** Brand-blank row(s).")
     st.dataframe(preview, use_container_width=True)
@@ -814,6 +848,29 @@ if run:
                         **row.to_dict(),
                         "status": "FAIL",
                         "error": f"Departure mismatch at FROM CRS (RTT: {seg['act_dep']})",
+                        "operator": op,
+                        "planned_cancel": "Y" if planned_cancel else "",
+                        "realtimeActivated": "Y" if realtime_activated else "",
+                        "serviceUid": uid,
+                        "runDate": rtt_run_date,
+                        "act_from": seg["act_from"],
+                        "act_to": seg["act_to"],
+                        "act_dep": seg["act_dep"],
+                        "act_arr": seg["act_arr"],
+                        "origin_rtt_deps": origin_rtt_deps,
+                    }
+                )
+                done += 1
+                progress.progress(min(1.0, done / total))
+                continue
+
+            # SAFETY NET: if you expect an arrival time but RTT doesn't provide one, don't mark OK
+            if row["exp_arr"] and not seg["act_arr"]:
+                results.append(
+                    {
+                        **row.to_dict(),
+                        "status": "FAIL",  # or "NOT CHECKED" if you prefer
+                        "error": "Arrival time not available in RTT for TO CRS (cannot validate exp_arr)",
                         "operator": op,
                         "planned_cancel": "Y" if planned_cancel else "",
                         "realtimeActivated": "Y" if realtime_activated else "",
