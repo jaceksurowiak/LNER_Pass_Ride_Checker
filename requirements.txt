@@ -1,3 +1,4 @@
-streamlit
+streamlit>=1.40
 pandas
 requests
+openpyxl
