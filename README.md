@@ -26,14 +26,12 @@ against Realtime Trains, and produces **WKxx PASS RIDES.xlsx**.
 1. Go to share.streamlit.io and sign in with GitHub.
    - **Existing app:** it redeploys by itself after the commit. If not, open the app's menu → **Reboot**.
    - **New app:** **Create app** → pick the repository, branch `main`, main file `app.py` → **Deploy**.
-2. Add your Realtime Trains login: app menu → **Settings → Secrets**, and paste:
+2. Add your Realtime Trains **API** login (the `rttapi_…` username from the RTT API portal, not your website login). The app won't start without it: app menu → **Settings → Secrets**, and paste:
 
    ```toml
    RTT_USER = "your-rtt-api-username"
    RTT_PASS = "your-rtt-api-password"
    ```
-
-   Without these the app runs in demo mode with made-up RTT data (every failure is labelled "DEMO (not real)").
 
 ## Using it
 

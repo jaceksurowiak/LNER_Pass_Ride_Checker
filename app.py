@@ -399,64 +399,6 @@ class RTTClient:
         return self._get(f"{RTT_BASE}/json/service/{uid}/{y}/{m}/{d}", ttl=3600)
 
 
-class DemoRTT:
-    """
-    Simulated RTT built from the expected trips themselves, with a few deliberate
-    problems mixed in so every result type shows up. Used when no RTT login is set.
-    """
-    OPERATORS = {
-        "EDB": "ScotRail", "HYM": "ScotRail", "ABD": "ScotRail", "DEE": "ScotRail", "PTH": "ScotRail",
-        "STG": "ScotRail", "KDY": "ScotRail", "GLT": "ScotRail", "CAR": "Northern", "NCL": "Northern",
-        "MBR": "TransPennine Express", "LDS": "Northern", "YRK": "TransPennine Express",
-        "HUL": "Northern", "SKI": "Northern", "WKK": "Northern", "KGX": "Great Northern",
-        "AAP": "Great Northern", "FPK": "Great Northern", "SVG": "Thameslink", "STP": "Thameslink",
-        "DON": "Northern", "LCN": "East Midlands Railway", "PBO": "East Midlands Railway",
-    }
-
-    def __init__(self, expected: pd.DataFrame):
-        self.search: Dict[tuple, list] = {}
-        self.detail: Dict[str, dict] = {}
-        trips = expected.dropna(subset=["origin_crs", "dest_crs"]).drop_duplicates(TRIP_KEY)
-        for n, r in enumerate(trips.itertuples(index=False)):
-            fault = {3: 3, 17: 9, 29: 14, 41: 19}.get(n % 53)   # ~1 in 13 trains gets a problem
-            if n % 61 == 7:
-                continue  # headcode missing from RTT
-            uid = f"D{n:05d}"
-            dep = (r.exp_dep or "12:00").replace(":", "")
-            arr = (r.exp_arr or "12:30").replace(":", "")
-            if fault == 3:
-                dep = self._shift(dep, 2)
-            if fault == 9:
-                arr = self._shift(arr, 4)
-            svc = {
-                "trainIdentity": r.headcode, "serviceUid": uid, "runDate": r.date,
-                "atocName": self.OPERATORS.get(r.origin_crs, "Northern"),
-                "plannedCancel": fault == 14,
-                "locationDetail": {"gbttBookedDeparture": dep},
-            }
-            self.search.setdefault((r.origin_crs, r.date), []).append(svc)
-            self.detail[uid] = {"locations": [
-                {"crs": r.origin_crs, "description": r.exp_from.strip(),
-                 "locationDetail": {"gbttBookedDeparture": dep}},
-                {"crs": r.dest_crs, "description": r.exp_to.strip(),
-                 "locationDetail": {"gbttBookedArrival": arr,
-                                    "displayAs": "CANCELLED_CALL" if fault == 19 else "CALL"}},
-            ]}
-
-    @staticmethod
-    def _shift(hhmm: str, mins: int) -> str:
-        t = (int(hhmm[:2]) * 60 + int(hhmm[2:4]) + mins) % 1440
-        return f"{t // 60:02d}{t % 60:02d}"
-
-    def location_search(self, crs: str, run_date: dt.date) -> dict:
-        time.sleep(0.01)
-        return {"services": self.search.get((crs, run_date.isoformat()), [])}
-
-    def service_detail(self, uid: str, run_date_iso: str) -> dict:
-        time.sleep(0.01)
-        return self.detail.get(uid, {"locations": []})
-
-
 # ============================================================
 # Checking engine
 # ============================================================
@@ -841,7 +783,10 @@ def main():
         rtt_pass = st.secrets.get("RTT_PASS", "")
     except Exception:   # no secrets file at all
         rtt_user = rtt_pass = ""
-    has_login = bool(rtt_user and rtt_pass)
+    if not (rtt_user and rtt_pass):
+        st.error("The Realtime Trains API login is missing. In Streamlit, open the app menu → "
+                 "**Settings → Secrets** and add `RTT_USER` and `RTT_PASS`, then reload the app.")
+        st.stop()
 
     # ---------------- Sidebar: files ----------------
     with st.sidebar:
@@ -890,13 +835,6 @@ def main():
         days = day_picker(f"days_{file_id}")
         st.caption("Trains after midnight on a diagram are checked on the following day automatically.")
 
-        st.markdown("### RTT connection")
-        if has_login:
-            demo = st.toggle("Demo mode (simulated RTT)", value=False)
-            st.caption("🟢 Live RTT login found." if not demo else "🧪 Using simulated data.")
-        else:
-            demo = True
-            st.caption("🧪 No RTT login in Secrets – running in demo mode with simulated RTT data.")
         with st.expander("Advanced"):
             workers = st.slider("Parallel RTT requests", 1, 16, DEFAULT_WORKERS,
                                 help="Higher is faster. The app slows down by itself if RTT asks it to.")
@@ -913,7 +851,7 @@ def main():
 
     expected = build_expected(trips, diagram_dates)
 
-    fingerprint = (file_id, week, tuple(days), getattr(refs_file, "name", None), getattr(refs_file, "size", None), demo)
+    fingerprint = (file_id, week, tuple(days), getattr(refs_file, "name", None), getattr(refs_file, "size", None))
     if st.session_state.get("fingerprint") != fingerprint:
         st.session_state.pop("report", None)       # inputs changed: old results are stale
         st.session_state["fingerprint"] = fingerprint
@@ -948,7 +886,7 @@ def main():
         if not run:
             st.stop()
 
-        client = DemoRTT(expected) if demo else get_live_client(rtt_user, rtt_pass)
+        client = get_live_client(rtt_user, rtt_pass)
         bar = st.progress(0.0, text="Starting…")
         t0 = time.time()
 
@@ -956,13 +894,9 @@ def main():
             bar.progress(done / max(total, 1), text=f"Checked {done} of {total} trains · {fails} failed so far")
 
         report = run_checks(expected, client, workers=workers, progress=on_progress)
-        if demo:   # make it obvious these problems are invented, not real RTT findings
-            bad = report["status"] != STATUS_OK
-            report.loc[bad, "error"] = "DEMO (not real): " + report.loc[bad, "error"].astype(str)
         bar.empty()
         st.session_state["report"] = report
         st.session_state["elapsed"] = time.time() - t0
-        st.session_state["was_demo"] = demo
 
     # ---------------- Results ----------------
     per_train = report.drop_duplicates(TRIP_KEY)
@@ -977,8 +911,6 @@ def main():
     if head_r.button("↺ New check", use_container_width=True):
         st.session_state.pop("report", None)
         st.rerun()
-    if st.session_state.get("was_demo"):
-        st.caption("🧪 Demo mode: RTT data is simulated, so these results are only an example.")
 
     tiles([
         ("Trains OK", t_ok, "ok"),
@@ -995,7 +927,7 @@ def main():
     table = report_table(report)
     by_diag = diagram_summary(report)
 
-    summary = build_summary(report, wk_label, week_dates, days_label, bool(st.session_state.get("was_demo")))
+    summary = build_summary(report, wk_label, week_dates, days_label)
     st.download_button(f"📊 Download {out_name}.xlsx", to_excel(report, summary, by_diag),
                        file_name=f"{out_name}.xlsx", type="primary", use_container_width=True,
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -1028,16 +960,14 @@ def main():
 
 
 
-def build_summary(report: pd.DataFrame, wk_label: str, week_dates: List[dt.date], days_label: str,
-                  demo: bool) -> pd.DataFrame:
+def build_summary(report: pd.DataFrame, wk_label: str, week_dates: List[dt.date], days_label: str) -> pd.DataFrame:
     per_train = report.drop_duplicates(TRIP_KEY)
     cnt = lambda df, s: int((df["status"] == s).sum())
     return pd.DataFrame({
-        "Item": ["Railway week", "Diagram dates", "Diagram days", "Mode",
+        "Item": ["Railway week", "Diagram dates", "Diagram days",
                  "Trains checked", "Trains OK", "Trains failed", "Trains not checked",
                  "Diagram rows", "Diagram rows with an issue", "After-midnight trains", "Generated"],
         "Value": [wk_label, f"{week_dates[0]:%d/%m/%Y} to {week_dates[-1]:%d/%m/%Y}", days_label,
-                  "Demo (simulated RTT)" if demo else "Live RTT",
                   len(per_train), cnt(per_train, STATUS_OK), cnt(per_train, STATUS_FAIL), cnt(per_train, STATUS_NC),
                   len(report), int((report["status"] != STATUS_OK).sum()), int(per_train["after_midnight"].sum()),
                   dt.datetime.now().strftime("%d/%m/%Y %H:%M")],
