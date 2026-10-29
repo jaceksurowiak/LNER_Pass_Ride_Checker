@@ -21,7 +21,10 @@ from requests.auth import HTTPBasicAuth
 
 RTT_BASE = "https://secure.realtimetrains.co.uk/api"
 DEFAULT_RAILREFS_PATH = "RailReferences.csv"
+# Parallel RTT requests. Change DEFAULT_WORKERS to set the default, or add
+# RTT_WORKERS = 10 to Streamlit Secrets to override it without editing code.
 DEFAULT_WORKERS = 8
+MAX_WORKERS = 16
 
 STATUS_OK = "OK"
 STATUS_FAIL = "FAIL"
@@ -704,7 +707,12 @@ h1, h2, h3, h4 { font-family: var(--f-display) !important; letter-spacing: -.01e
 .prc-tile.nc   { border-color: rgba(90,101,119,.45); }
 .prc-tile.moon { border-color: rgba(115,57,191,.45); background: rgba(115,57,191,.10); }
 .prc-tile.moon .v { color: var(--bh); }
-section[data-testid="stSidebar"] h3 { font-size: .95rem; margin-top: .6rem; }
+section[data-testid="stSidebar"] h3 { font: 600 .78rem var(--f-mono) !important; text-transform: uppercase;
+  letter-spacing: .08em; opacity: .8; margin-top: .8rem; }
+.prc-wk { display: flex; gap: 14px; align-items: center; border: 1px solid rgba(128,128,128,.35);
+  border-radius: 10px; padding: 10px 12px; }
+.prc-wk .n { font: 700 1.9rem/1 var(--f-display); color: #4A6CF0; }
+.prc-wk .d { font-size: .82rem; opacity: .8; line-height: 1.4; }
 </style>
 """
 
@@ -783,6 +791,12 @@ def main():
         rtt_pass = st.secrets.get("RTT_PASS", "")
     except Exception:   # no secrets file at all
         rtt_user = rtt_pass = ""
+    try:
+        default_workers = int(st.secrets.get("RTT_WORKERS", DEFAULT_WORKERS))
+    except Exception:
+        default_workers = DEFAULT_WORKERS
+    default_workers = max(1, min(MAX_WORKERS, default_workers))
+
     if not (rtt_user and rtt_pass):
         st.error("The Realtime Trains API login is missing. In Streamlit, open the app menu → "
                  "**Settings → Secrets** and add `RTT_USER` and `RTT_PASS`, then reload the app.")
@@ -795,7 +809,8 @@ def main():
 
         st.markdown("### 2 · RailReferences")
         refs_file = st.file_uploader("Upload an updated RailReferences.csv (optional)", type=["csv"], key="refs")
-        st.caption("Leave empty to use the RailReferences.csv saved with the app.")
+        refs_note = st.empty()
+        refs_note.caption("Leave empty to use the RailReferences.csv saved with the app.")
 
     # ---------------- Load files ----------------
     try:
@@ -817,26 +832,34 @@ def main():
             st.write(list(raw.columns))
         st.stop()
     trips = prepare_trips(raw, cols, desc_to_crs)
+    stations = set(trips["exp_from"]) | set(trips["exp_to"])
+    n_missing = len(set(trips.loc[trips["origin_crs"].isna(), "exp_from"]) | set(trips.loc[trips["dest_crs"].isna(), "exp_to"]))
+    which = "your uploaded copy" if refs_file is not None else "the app's saved copy"
+    refs_note.caption(f"Using {which}. " + (f"All {len(stations)} stations matched." if not n_missing
+                      else f"{len(stations) - n_missing} of {len(stations)} stations matched – see the warning on the right."))
 
     # ---------------- Sidebar: week, days, connection ----------------
     file_id = f"{pass_file.name}_{pass_file.size}"
-    detected = detect_rail_week(trips) or rail_week_of(dt.date.today())
+    from_file = detect_rail_week(trips)
+    detected = from_file or rail_week_of(dt.date.today())
     rail_year = detected[0]
     with st.sidebar:
         st.markdown("### 3 · Railway week")
-        week = int(st.number_input(f"Week (rail year {rail_year}/{str(rail_year + 1)[-2:]})", min_value=1,
-                                   max_value=weeks_in_rail_year(rail_year), value=detected[1], step=1,
-                                   key=f"wk_{file_id}"))
+        week = detected[1]
         week_dates = rail_week_dates(rail_year, week)
-        st.caption(f"Sat {week_dates[0]:%d %b} – Fri {week_dates[-1]:%d %b %Y}"
-                   + (" · from the file" if week == detected[1] else ""))
+        source = "from the file" if from_file else "no diagram dates in the file – using this week"
+        st.markdown(
+            f'<div class="prc-wk"><span class="n">WK{week:02d}</span><span class="d">'
+            f'Sat {week_dates[0]:%d %b} – Fri {week_dates[-1]:%d %b %Y}<br>'
+            f'Rail year {rail_year}/{str(rail_year + 1)[-2:]} · {source}</span></div>',
+            unsafe_allow_html=True)
 
         st.markdown("### 4 · Diagram days")
         days = day_picker(f"days_{file_id}")
         st.caption("Trains after midnight on a diagram are checked on the following day automatically.")
 
         with st.expander("Advanced"):
-            workers = st.slider("Parallel RTT requests", 1, 16, DEFAULT_WORKERS,
+            workers = st.slider("Parallel RTT requests", 1, MAX_WORKERS, default_workers,
                                 help="Higher is faster. The app slows down by itself if RTT asks it to.")
 
     diagram_dates = [d for d, name in zip(week_dates, DAY_SHORT) if name in days]
