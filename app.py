@@ -33,6 +33,9 @@ DEFAULT_RAILREFS_PATH = "RailReferences.csv"
 # RTT_WORKERS = 10 to Streamlit Secrets to override it without editing code.
 DEFAULT_WORKERS = 8
 MAX_WORKERS = 16
+RTT_TRIES = 5                            # tries per RTT request before giving up
+RTT_HORIZON_DAYS = 179                   # the old RTT API answers about 6 months ahead (searches 180+ days out return 502)
+RTT_TEMPORARY = {500, 502, 503, 504}     # server errors worth trying again
 
 STATUS_OK = "OK"
 STATUS_FAIL = "FAIL"
@@ -442,17 +445,24 @@ class RTTClient:
             hit = self._cache.get((url,))
             if hit and now - hit[0] < ttl:
                 return hit[1]
-        for attempt in range(3):
-            r = self._session().get(url, timeout=30)
-            if r.status_code == 429 and attempt < 2:   # throttled: back off and retry
-                time.sleep(1.5 * (attempt + 1))
+        last = "no reply"
+        for attempt in range(RTT_TRIES):
+            if attempt:
+                time.sleep(min(2 ** attempt, 20))      # 2, 4, 8, 16 s between tries
+            try:
+                r = self._session().get(url, timeout=30)
+            except (requests.ConnectionError, requests.Timeout) as e:
+                last = type(e).__name__
+                continue
+            if r.status_code == 429 or r.status_code in RTT_TEMPORARY:   # busy or a server hiccup: try again
+                last = f"{r.status_code} {r.reason}"
                 continue
             r.raise_for_status()
             data = r.json()
             with self._lock:
                 self._cache[(url,)] = (time.time(), data)
             return data
-        raise RuntimeError("RTT rate limit")
+        raise RTTUnavailable(last)
 
     def location_search(self, crs: str, run_date: dt.date) -> dict:
         return self._get(f"{RTT_BASE}/json/search/{crs}/{run_date:%Y/%m/%d}", ttl=300)
@@ -460,6 +470,13 @@ class RTTClient:
     def service_detail(self, uid: str, run_date_iso: str) -> dict:
         y, m, d = str(run_date_iso).split("-")
         return self._get(f"{RTT_BASE}/json/service/{uid}/{y}/{m}/{d}", ttl=3600)
+
+
+class RTTUnavailable(Exception):
+    """RTT didn't give an answer after several tries (server busy or down)."""
+
+
+NO_ANSWER = "RTT didn't answer"
 
 
 # ============================================================
@@ -475,7 +492,7 @@ def flatten_services(payload: dict) -> pd.DataFrame:
             "runDate": s.get("runDate"),
             "operator": s.get("atocName") or "",
             "plannedCancel": bool(s.get("plannedCancel", False)),
-            "dep": rtt_to_hhmm(ld.get("gbttBookedDeparture") or ld.get("wttBookedDeparture")),
+            "dep": rtt_to_hhmm(ld.get("gbttBookedDeparture")),      # public time only
         })
     return pd.DataFrame(rows, columns=["trainIdentity", "serviceUid", "runDate", "operator", "plannedCancel", "dep"])
 
@@ -492,10 +509,10 @@ def extract_segment(detail: dict, origin_crs: str, dest_crs: str) -> dict:
         cancelled = (ld.get("displayAs") in CANCELLED) or bool(ld.get("cancelReasonCode"))
         if not seg["from_found"] and crs == origin_crs:
             seg.update(from_found=True, act_from=loc.get("description"), from_cancelled=cancelled,
-                       act_dep=rtt_to_hhmm(ld.get("gbttBookedDeparture") or ld.get("wttBookedDeparture")))
+                       act_dep=rtt_to_hhmm(ld.get("gbttBookedDeparture")))
         elif seg["from_found"] and crs == dest_crs:
             seg.update(to_found=True, act_to=loc.get("description"), to_cancelled=cancelled,
-                       act_arr=rtt_to_hhmm(ld.get("gbttBookedArrival") or ld.get("wttBookedArrival")))
+                       act_arr=rtt_to_hhmm(ld.get("gbttBookedArrival")))
             break
     return seg
 
@@ -534,6 +551,7 @@ def judge(trip: dict, c, extra: dict, detail: dict) -> dict:
     common = dict(operator=c["operator"], serviceUid=c["serviceUid"], runDate=c["runDate"],
                   act_from=seg["act_from"], act_to=seg["act_to"], act_dep=seg["act_dep"],
                   act_arr=seg["act_arr"], origin_rtt_deps=extra["origin_rtt_deps"])
+
     if not seg["from_found"]:
         return _result(STATUS_FAIL, f"Train doesn't call at {trip['exp_from']} ({trip['origin_crs']})", **common)
     if not seg["to_found"]:
@@ -542,22 +560,33 @@ def judge(trip: dict, c, extra: dict, detail: dict) -> dict:
         return _result(STATUS_FAIL, f"Call at {trip['exp_from']} cancelled", **common)
     if seg["to_cancelled"]:
         return _result(STATUS_FAIL, f"Call at {trip['exp_to']} cancelled", **common)
-    if trip["exp_dep"] and seg["act_dep"] and trip["exp_dep"] != seg["act_dep"]:
+    if trip["exp_dep"] and not seg["act_dep"]:
+        return _result(STATUS_FAIL, f"No public departure at {trip['exp_from']} in RTT", **common)
+    if trip["exp_arr"] and not seg["act_arr"]:
+        return _result(STATUS_FAIL, f"No public arrival at {trip['exp_to']} in RTT", **common)
+    if trip["exp_dep"] and trip["exp_dep"] != seg["act_dep"]:
         return _result(STATUS_FAIL, f"Departure differs: RTT {seg['act_dep']}", **common)
-    if trip["exp_arr"] and seg["act_arr"] and trip["exp_arr"] != seg["act_arr"]:
+    if trip["exp_arr"] and trip["exp_arr"] != seg["act_arr"]:
         return _result(STATUS_FAIL, f"Arrival differs: RTT {seg['act_arr']}", **common)
     return _result(STATUS_OK, "", **common)
 
 
 def run_checks(expected: pd.DataFrame, client, workers: int = DEFAULT_WORKERS,
-               progress: Optional[Callable[[int, int, int], None]] = None) -> pd.DataFrame:
+               progress: Optional[Callable[[int, int, int], None]] = None,
+               horizon_days: Optional[int] = None) -> pd.DataFrame:
     """Check every unique trip once (in parallel) and spread results back to every diagram row."""
     trips = expected.drop_duplicates(TRIP_KEY).to_dict("records")
     results: Dict[tuple, dict] = {}
     pending = []
     for t in trips:
         k = tuple(t[c] for c in TRIP_KEY)
-        if not isinstance(t["origin_crs"], str):
+        too_far = (horizon_days is not None and
+                   dt.date.fromisoformat(t["date"]) > dt.date.today() + dt.timedelta(days=horizon_days))
+        if too_far:
+            ready = dt.date.fromisoformat(t["date"]) - dt.timedelta(days=horizon_days)
+            results[k] = _result(STATUS_NC, f"Too far ahead – RTT only looks about 6 months ahead. "
+                                            f"Check again from {ready:%d %b %Y}")
+        elif not isinstance(t["origin_crs"], str):
             results[k] = _result(STATUS_NC, f"'{t['exp_from']}' not in RailReferences (no CRS)")
         elif not isinstance(t["dest_crs"], str):
             results[k] = _result(STATUS_NC, f"'{t['exp_to']}' not in RailReferences (no CRS)")
@@ -592,7 +621,8 @@ def run_checks(expected: pd.DataFrame, client, workers: int = DEFAULT_WORKERS,
         for k, t in pending:
             loc = loc_data[(t["origin_crs"], t["date"])]
             if isinstance(loc, Exception):
-                results[k] = _result(STATUS_FAIL, f"RTT station search failed: {loc}"); tick(results[k]); continue
+                results[k] = _result(STATUS_NC, f"{NO_ANSWER} the station search ({loc}) – use Re-check")
+                tick(results[k]); continue
             c, info = pick_candidate(t, loc)
             if c is None:
                 results[k] = info; tick(info); continue
@@ -602,7 +632,8 @@ def run_checks(expected: pd.DataFrame, client, workers: int = DEFAULT_WORKERS,
             try:
                 results[k] = judge(t, c, info, f.result())
             except Exception as e:
-                results[k] = _result(STATUS_FAIL, f"RTT service lookup failed: {e}", serviceUid=c["serviceUid"])
+                results[k] = _result(STATUS_NC, f"{NO_ANSWER} the train lookup ({e}) – use Re-check",
+                                     serviceUid=c["serviceUid"])
             tick(results[k])
 
     res_df = pd.DataFrame([{**dict(zip(TRIP_KEY, k)), **v} for k, v in results.items()])
@@ -1060,12 +1091,13 @@ def main():
         def on_progress(done, total, fails):
             bar.progress(done / max(total, 1), text=f"Checked {done} of {total} trains · {fails} failed so far")
 
-        report = run_checks(expected, client, workers=workers, progress=on_progress)
+        report = run_checks(expected, client, workers=workers, progress=on_progress, horizon_days=RTT_HORIZON_DAYS)
         bar.empty()
         st.session_state["report"] = report
         st.session_state["elapsed"] = time.time() - t0
 
     # ---------------- Results ----------------
+    RECHECK_CLIENT = lambda: get_live_client(rtt_user, rtt_pass)
     per_train = report.drop_duplicates(TRIP_KEY)
     t_ok = int((per_train["status"] == STATUS_OK).sum())
     t_fail = int((per_train["status"] == STATUS_FAIL).sum())
@@ -1078,6 +1110,23 @@ def main():
     if head_r.button("↺ New check", use_container_width=True):
         st.session_state.pop("report", None)
         st.rerun()
+
+    unanswered = report["error"].astype(str).str.startswith(NO_ANSWER)
+    if unanswered.any():
+        n_un = report.loc[unanswered].drop_duplicates(TRIP_KEY).shape[0]
+        st.warning(f"Realtime Trains didn't answer for {n_un} train(s), even after several tries. "
+                   "This is a problem on RTT's side, not with the trains. Re-check them in a minute or two.")
+        if st.button(f"↻ Re-check {n_un} train(s) RTT didn't answer", type="primary"):
+            bar = st.progress(0.0, text="Re-checking…")
+            redo = run_checks(report.loc[unanswered, list(expected.columns)].reset_index(drop=True),
+                              RECHECK_CLIENT(), workers=workers, horizon_days=RTT_HORIZON_DAYS,
+                              progress=lambda d, t, f: bar.progress(d / max(t, 1), text=f"Re-checked {d} of {t}"))
+            bar.empty()
+            result_cols = [c for c in redo.columns if c not in expected.columns]
+            report = report.copy()
+            report.loc[unanswered, result_cols] = redo[result_cols].values
+            st.session_state["report"] = report
+            st.rerun()
 
     tiles([
         ("Trains OK", t_ok, "ok"),
