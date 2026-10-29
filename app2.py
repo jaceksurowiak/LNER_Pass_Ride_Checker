@@ -1136,8 +1136,12 @@ def main():
 
     wk_label = label
     out_name = f"{label} PASS RIDES"
-    days_label = "Sat–Fri" if len(days) == 7 else ", ".join(days) if days else "no days"
-    heading = f"{label} · {days_label} · {check_dates[0]:%d %b %Y} – {check_dates[-1]:%d %b %Y}"
+    if mode == "ltp":   # a working timetable runs Sunday to Saturday
+        order = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+        days_label = "Sun–Sat" if len(days) == 7 else ", ".join(d for d in order if d in days) or "no days"
+    else:               # a railway week runs Saturday to Friday
+        days_label = "Sat–Fri" if len(days) == 7 else ", ".join(days) if days else "no days"
+    heading = f"{label} · {days_label} · {check_dates[0]:%a %d %b %Y} – {check_dates[-1]:%a %d %b %Y}"
 
     if not days:
         st.warning("Pick at least one diagram day in the sidebar.")
