@@ -2,3 +2,5 @@ streamlit>=1.40
 pandas
 requests
 openpyxl
+tzdata
+streamlit-js-eval

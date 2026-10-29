@@ -3,8 +3,11 @@ LNER (TRENT) - Pass Ride Checker
 Checks other operators' trains (Brand blank) in a TRACS pass-trips export
 against Realtime Trains (RTT).
 
+VERSION FOR THE OLD RTT API (secure.realtimetrains.co.uk/api) – works until 31 March 2027.
+From then on use app2.py, which uses the new token-based API.
+
 Run:  streamlit run app.py
-Secrets (.streamlit/secrets.toml):  RTT_USER = "...", RTT_PASS = "..."
+Secrets:  RTT_USER = "...", RTT_PASS = "..."
 """
 import io
 import re
@@ -17,6 +20,11 @@ from typing import Optional, Dict, Set, List, Tuple, Callable
 import pandas as pd
 import requests
 import streamlit as st
+
+try:   # lets the app remember settings in your browser
+    from streamlit_js_eval import streamlit_js_eval
+except ImportError:
+    streamlit_js_eval = None
 from requests.auth import HTTPBasicAuth
 
 RTT_BASE = "https://secure.realtimetrains.co.uk/api"
@@ -354,6 +362,41 @@ def build_expected(trips: pd.DataFrame, diagram_dates: List[dt.date]) -> pd.Data
     return pd.DataFrame(rows)
 
 
+def expected_for_days(trips: pd.DataFrame, week_dates: List[dt.date], days: List[str]) -> pd.DataFrame:
+    """
+    Trips for the chosen days of the week. A day includes
+      - every trip on that day's diagrams, and
+      - after-midnight trips that RUN on that day from the previous day's diagram,
+        even when that diagram is outside the chosen days (e.g. Friday diagram,
+        train at 00:17 on Saturday when only Saturday is picked).
+    """
+    exp = build_expected(trips, week_dates)
+    if exp.empty:
+        return exp
+    picked = {DAY_SHORT.index(d) for d in days}               # 0 = Sat … 6 = Fri
+    diag_idx = exp["rail_day"] - 1
+    run_idx = exp["date"].map(lambda d: rail_day_index(dt.date.fromisoformat(d)) - 1)
+    keep = diag_idx.isin(picked) | (exp["after_midnight"] & run_idx.isin(picked))
+    out = exp[keep].copy()
+    out["run_day"] = out["date"].map(lambda d: dt.date.fromisoformat(d).strftime("%A"))
+    return out.reset_index(drop=True)
+
+
+DAY_SHORT = ["Sat", "Sun", "Mon", "Tue", "Wed", "Thu", "Fri"]
+WORKERS_STORE = "pass_ride_checker_parallel_requests"
+
+
+def remembered_workers() -> Optional[int]:
+    """The default saved in this browser, or None if there isn't one (yet)."""
+    if streamlit_js_eval is None:
+        return None
+    val = streamlit_js_eval(js_expressions=f"localStorage.getItem('{WORKERS_STORE}')", key="read_saved_workers")
+    try:
+        return max(1, min(MAX_WORKERS, int(val)))
+    except (TypeError, ValueError):
+        return None
+
+
 # ============================================================
 # RTT clients
 # ============================================================
@@ -596,6 +639,7 @@ def report_table(report: pd.DataFrame, for_export: bool = False) -> pd.DataFrame
         "Diagram date": r["diagram_date"],
         "Diagram day": r["diagram_day"],
         "Runs on": r["date"],
+        "Run day": r["run_day"] if "run_day" in r else r["diagram_day"],
         "After midnight": r["after_midnight"].map({True: "Y", False: ""}),
         "Headcode": r["headcode"],
         "From": r["exp_from"],
@@ -642,6 +686,7 @@ def compact_view(out: pd.DataFrame) -> pd.DataFrame:
         "Runs on": runs,                       # only filled for after-midnight trains
         # used by the filters, not shown
         "Depot": out["Depot"], "Diagram day": out["Diagram day"], "Diagram date": out["Diagram date"],
+        "Run day": out["Run day"],
     })
 
 
@@ -741,6 +786,7 @@ def get_live_client(user: str, pw: str) -> RTTClient:
     return RTTClient(user, pw)
 
 
+
 @st.cache_data(show_spinner=False)
 def cached_railrefs_from_repo(path: str) -> pd.DataFrame:
     return read_railrefs(path)
@@ -750,20 +796,19 @@ def filters(df: pd.DataFrame, prefix: str) -> pd.DataFrame:
     c1, c2, c3, c4 = st.columns([1.2, 1, 1.2, 1])
     status = c1.multiselect("Status", sorted(df["Status"].unique()), key=f"{prefix}_st")
     depot = c2.multiselect("Depot", sorted(x for x in df["Depot"].unique() if x), key=f"{prefix}_dp")
-    day = c3.multiselect("Diagram day", [d for d in RAIL_ORDER if d in set(df["Diagram day"])], key=f"{prefix}_dy")
+    present = set(df["Diagram day"]) | set(df["Run day"])
+    day = c3.multiselect("Day", [d for d in RAIL_ORDER if d in present], key=f"{prefix}_dy",
+                         help="Diagram day, plus after-midnight trains that run on that day")
     q = c4.text_input("Headcode / station", key=f"{prefix}_q").strip().lower()
     if status:
         df = df[df["Status"].isin(status)]
     if depot:
         df = df[df["Depot"].isin(depot)]
     if day:
-        df = df[df["Diagram day"].isin(day)]
+        df = df[df["Diagram day"].isin(day) | df["Run day"].isin(day)]
     if q:
         df = df[df[["Headcode", "Journey", "Diagram"]].apply(lambda r: q in " ".join(map(str, r)).lower(), axis=1)]
     return df
-
-
-DAY_SHORT = ["Sat", "Sun", "Mon", "Tue", "Wed", "Thu", "Fri"]
 
 
 def day_picker(key_: str) -> List[str]:
@@ -858,21 +903,37 @@ def main():
         days = day_picker(f"days_{file_id}")
         st.caption("Trains after midnight on a diagram are checked on the following day automatically.")
 
-        with st.expander("Advanced"):
-            workers = st.slider("Parallel RTT requests", 1, MAX_WORKERS, default_workers,
+        st.markdown("### RTT")
+        st.caption("Old Realtime Trains API – Realtime Trains switches it off on 31 Mar 2027. "
+                   "Use app2.py (new API) from then on.")
+        saved = remembered_workers()
+        if saved is not None and not st.session_state.get("_workers_loaded"):
+            st.session_state["workers"] = saved          # apply the browser's saved default once
+            st.session_state["_workers_loaded"] = True
+        st.session_state.setdefault("workers", default_workers)
+        with st.expander(f"Advanced · {st.session_state['workers']} parallel requests"):
+            workers = st.slider("Parallel RTT requests", 1, MAX_WORKERS, key="workers",
                                 help="Higher is faster. The app slows down by itself if RTT asks it to.")
+            if streamlit_js_eval is not None:
+                if st.button(f"Save {workers} as my default", use_container_width=True):
+                    streamlit_js_eval(js_expressions=f"localStorage.setItem('{WORKERS_STORE}', '{workers}')",
+                                      key=f"save_workers_{workers}_{time.time()}")
+                    st.toast(f"Saved. The app will start with {workers} parallel requests in this browser.")
+                st.caption(f"Saved default in this browser: {saved if saved is not None else 'none'} "
+                           f"(app default {default_workers}).")
+            else:
+                st.caption(f"Default {default_workers}. Set RTT_WORKERS in Secrets to change it.")
 
-    diagram_dates = [d for d, name in zip(week_dates, DAY_SHORT) if name in days]
     wk_label = f"WK{week:02d}"
     out_name = f"{wk_label} PASS RIDES"
     days_label = "Sat–Fri" if len(days) == 7 else ", ".join(days) if days else "no days"
     heading = f"{wk_label} · {days_label} · {week_dates[0]:%d %b} – {week_dates[-1]:%d %b %Y}"
 
-    if not diagram_dates:
+    if not days:
         st.warning("Pick at least one diagram day in the sidebar.")
         st.stop()
 
-    expected = build_expected(trips, diagram_dates)
+    expected = expected_for_days(trips, week_dates, days)
 
     fingerprint = (file_id, week, tuple(days), getattr(refs_file, "name", None), getattr(refs_file, "size", None))
     if st.session_state.get("fingerprint") != fingerprint:
