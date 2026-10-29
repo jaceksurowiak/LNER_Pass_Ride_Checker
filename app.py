@@ -318,6 +318,22 @@ def weeks_in_rail_year(rail_year: int) -> int:
     return (rail_year_start(rail_year + 1) - rail_year_start(rail_year)).days // 7
 
 
+def timetable_name(start: dt.date) -> Tuple[str, str]:
+    """
+    Short and Network Rail names for the working timetable that starts on `start`
+    (the first date of the LTP diagrams), e.g.
+      13 Dec 2026 -> ("DEC26 WTT", "2027 Principal Timetable")
+      16 May 2027 -> ("MAY27 WTT", "2027 Subsidiary Timetable")
+      16 Jul 2028 -> ("JUL28 WTT", "2028 Subsidiary Timetable")
+    Network Rail names a timetable by the year most of it runs in; the December
+    one is the Principal timetable, the mid-year one (May, July from 2028) the Subsidiary.
+    """
+    short = f"{start:%b}".upper() + f"{start:%y} WTT"
+    official = (f"{start.year + 1} Principal Timetable" if start.month in (11, 12)
+                else f"{start.year} Subsidiary Timetable")
+    return short, official
+
+
 def detect_rail_week(trips: pd.DataFrame) -> Optional[Tuple[int, int]]:
     """Railway week the file is for: the week most diagram start dates fall in."""
     weeks = [rail_week_of(d) for d in trips["diag_start"] if isinstance(d, dt.date)]
@@ -347,6 +363,7 @@ def build_expected(trips: pd.DataFrame, diagram_dates: List[dt.date]) -> pd.Data
             if not (in_window(day, r.train_start, r.train_end) or in_window(run_day, r.train_start, r.train_end)):
                 continue
             rows.append({
+                "week": "WK%02d" % rail_week_of(day)[1],
                 "diagram_date": day.isoformat(),
                 "diagram_day": day.strftime("%A"),
                 "rail_day": rd,
@@ -608,6 +625,8 @@ def to_excel(report: pd.DataFrame, summary: pd.DataFrame, by_diag: pd.DataFrame)
         issues.to_excel(xw, sheet_name="Issues", index=False)
         out.to_excel(xw, sheet_name="All results", index=False)
         by_diag.to_excel(xw, sheet_name="By diagram", index=False)
+        if report["week"].nunique() > 1:
+            week_summary(report).to_excel(xw, sheet_name="By week", index=False)
         for ws in xw.book.worksheets:
             ws.freeze_panes = "A2"
             ws.auto_filter.ref = ws.dimensions
@@ -636,6 +655,7 @@ def report_table(report: pd.DataFrame, for_export: bool = False) -> pd.DataFrame
     r = report.sort_values(["diagram_date", "date", "exp_dep", "headcode"], na_position="last")
     out = pd.DataFrame({
         "Status": r["status"],
+        "Week": r["week"],
         "Diagram date": r["diagram_date"],
         "Diagram day": r["diagram_day"],
         "Runs on": r["date"],
@@ -686,7 +706,7 @@ def compact_view(out: pd.DataFrame) -> pd.DataFrame:
         "Runs on": runs,                       # only filled for after-midnight trains
         # used by the filters, not shown
         "Depot": out["Depot"], "Diagram day": out["Diagram day"], "Diagram date": out["Diagram date"],
-        "Run day": out["Run day"],
+        "Run day": out["Run day"], "Week": out["Week"],
     })
 
 
@@ -707,6 +727,31 @@ def show_table(df: pd.DataFrame, cols: List[str] = SHOWN_COLS, height: Optional[
     kw = {"height": height} if height else {}
     st.dataframe(style_table(df), use_container_width=True, hide_index=True,
                  column_order=cols, column_config=cfg, **kw)
+
+
+def week_summary(report: pd.DataFrame) -> pd.DataFrame:
+    g = report.groupby("week", sort=False)
+    s = g.agg(From=("diagram_date", "min"), To=("diagram_date", "max"), Rows=("status", "size"),
+              OK=("status", lambda x: (x == STATUS_OK).sum()),
+              FAIL=("status", lambda x: (x == STATUS_FAIL).sum()),
+              NOT_CHECKED=("status", lambda x: (x == STATUS_NC).sum())).reset_index()
+    s = s.sort_values("From").rename(columns={"week": "Week", "NOT_CHECKED": "NOT CHECKED"})
+    for c in ("From", "To"):
+        s[c] = pd.to_datetime(s[c]).dt.strftime("%d/%m/%Y")
+    return s
+
+
+def grouped_issues(table: pd.DataFrame) -> pd.DataFrame:
+    """Collapse the same problem repeated on many dates into one line."""
+    bad = table[~table["Status"].str.contains("OK")]
+    if bad.empty:
+        return bad
+    g = bad.groupby(["Status", "Headcode", "Journey", "Dep", "Arr", "Issue", "Diagram"], sort=False)
+    out = g.agg(Dates=("Diagram date", "nunique"), First=("Diagram date", "min"),
+                Last=("Diagram date", "max")).reset_index()
+    for c in ("First", "Last"):
+        out[c] = pd.to_datetime(out[c]).dt.strftime("%a %d %b %Y")
+    return out.sort_values(["Dates", "Headcode"], ascending=[False, True])
 
 
 def diagram_summary(report: pd.DataFrame) -> pd.DataFrame:
@@ -800,6 +845,11 @@ def filters(df: pd.DataFrame, prefix: str) -> pd.DataFrame:
     day = c3.multiselect("Day", [d for d in RAIL_ORDER if d in present], key=f"{prefix}_dy",
                          help="Diagram day, plus after-midnight trains that run on that day")
     q = c4.text_input("Headcode / station", key=f"{prefix}_q").strip().lower()
+    wks = sorted(set(df["Week"]), key=lambda w: (w < "WK14", w)) if "Week" in df else []
+    if len(wks) > 1:
+        wk = st.multiselect("Week", wks, key=f"{prefix}_wk")
+        if wk:
+            df = df[df["Week"].isin(wk)]
     if status:
         df = df[df["Status"].isin(status)]
     if depot:
@@ -888,16 +938,45 @@ def main():
     from_file = detect_rail_week(trips)
     detected = from_file or rail_week_of(dt.date.today())
     rail_year = detected[0]
+    starts = [d for d in trips["diag_start"] if isinstance(d, dt.date)]
+    ends = [d for d in trips["diag_end"] if isinstance(d, dt.date)]
+    period = (min(starts), max(ends)) if starts and ends else None
+    multi_week = bool(period) and rail_week_of(period[0]) != rail_week_of(period[1])
     with st.sidebar:
-        st.markdown("### 3 · Railway week")
-        week = detected[1]
-        week_dates = rail_week_dates(rail_year, week)
-        source = "from the file" if from_file else "no diagram dates in the file – using this week"
-        st.markdown(
-            f'<div class="prc-wk"><span class="n">WK{week:02d}</span><span class="d">'
-            f'Sat {week_dates[0]:%d %b} – Fri {week_dates[-1]:%d %b %Y}<br>'
-            f'Rail year {rail_year}/{str(rail_year + 1)[-2:]} · {source}</span></div>',
-            unsafe_allow_html=True)
+        st.markdown("### 3 · What to check")
+        mode = "week"
+        if multi_week:
+            choice = st.radio("Check", ["Entire LTP period", "One railway week"], key=f"mode_{file_id}",
+                              label_visibility="collapsed")
+            mode = "ltp" if choice.startswith("Entire") else "week"
+        if mode == "ltp":
+            check_dates = [period[0] + dt.timedelta(days=i) for i in range((period[1] - period[0]).days + 1)]
+            w1, w2 = rail_week_of(period[0]), rail_week_of(period[1])
+            n_weeks = len({rail_week_of(d) for d in check_dates})
+            label, official = timetable_name(period[0])
+            st.markdown(
+                f'<div class="prc-wk"><span class="n">{label}</span><span class="d">'
+                f'{official}<br>{period[0]:%a %d %b %Y} – {period[1]:%a %d %b %Y}<br>'
+                f'WK{w1[1]:02d} to WK{w2[1]:02d} · {n_weeks} weeks · every date</span></div>',
+                unsafe_allow_html=True)
+        else:
+            if multi_week:   # an LTP file: choose which week of it
+                weeks = sorted({rail_week_of(period[0] + dt.timedelta(days=i))
+                                for i in range((period[1] - period[0]).days + 1)})
+                picked = st.selectbox("Railway week", weeks, key=f"wk_{file_id}",
+                                      format_func=lambda yw: f"WK{yw[1]:02d} · Sat {rail_week_dates(*yw)[0]:%d %b %Y}")
+                rail_year, week = picked
+                source = "week of the LTP"
+            else:
+                week = detected[1]
+                source = "from the file" if from_file else "no diagram dates in the file – using this week"
+            check_dates = rail_week_dates(rail_year, week)
+            label = f"WK{week:02d}"
+            st.markdown(
+                f'<div class="prc-wk"><span class="n">WK{week:02d}</span><span class="d">'
+                f'Sat {check_dates[0]:%d %b} – Fri {check_dates[-1]:%d %b %Y}<br>'
+                f'Rail year {rail_year}/{str(rail_year + 1)[-2:]} · {source}</span></div>',
+                unsafe_allow_html=True)
 
         st.markdown("### 4 · Diagram days")
         days = day_picker(f"days_{file_id}")
@@ -924,18 +1003,18 @@ def main():
             else:
                 st.caption(f"Default {default_workers}. Set RTT_WORKERS in Secrets to change it.")
 
-    wk_label = f"WK{week:02d}"
-    out_name = f"{wk_label} PASS RIDES"
+    wk_label = label
+    out_name = f"{label} PASS RIDES"
     days_label = "Sat–Fri" if len(days) == 7 else ", ".join(days) if days else "no days"
-    heading = f"{wk_label} · {days_label} · {week_dates[0]:%d %b} – {week_dates[-1]:%d %b %Y}"
+    heading = f"{label} · {days_label} · {check_dates[0]:%d %b %Y} – {check_dates[-1]:%d %b %Y}"
 
     if not days:
         st.warning("Pick at least one diagram day in the sidebar.")
         st.stop()
 
-    expected = expected_for_days(trips, week_dates, days)
+    expected = expected_for_days(trips, check_dates, days)
 
-    fingerprint = (file_id, week, tuple(days), getattr(refs_file, "name", None), getattr(refs_file, "size", None))
+    fingerprint = (file_id, label, tuple(days), getattr(refs_file, "name", None), getattr(refs_file, "size", None))
     if st.session_state.get("fingerprint") != fingerprint:
         st.session_state.pop("report", None)       # inputs changed: old results are stale
         st.session_state["fingerprint"] = fingerprint
@@ -1011,7 +1090,7 @@ def main():
     table = report_table(report)
     by_diag = diagram_summary(report)
 
-    summary = build_summary(report, wk_label, week_dates, days_label)
+    summary = build_summary(report, wk_label, check_dates, days_label)
     st.download_button(f"📊 Download {out_name}.xlsx", to_excel(report, summary, by_diag),
                        file_name=f"{out_name}.xlsx", type="primary", use_container_width=True,
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -1020,8 +1099,14 @@ def main():
     t_issues, t_all, t_diag = st.tabs([f"⚠️ Issues ({r_bad} rows)", f"All results ({len(report)} rows)", "By diagram"])
     with t_issues:
         bad = table[~table["Status"].str.contains("OK")]
+        multi = report["week"].nunique() > 1
         if bad.empty:
             st.success("No issues found.")
+        elif st.toggle("Group the same problem across dates", value=multi, key="group_issues"):
+            grp = grouped_issues(table)
+            st.caption(f"{len(grp)} distinct problems across {len(bad)} rows.")
+            st.dataframe(grp, use_container_width=True, hide_index=True,
+                         height=min(600, 38 + 35 * len(grp)))
         else:
             bad = filters(bad, "iss")
             show_table(bad, height=min(600, 38 + 35 * len(bad)))
@@ -1048,7 +1133,7 @@ def build_summary(report: pd.DataFrame, wk_label: str, week_dates: List[dt.date]
     per_train = report.drop_duplicates(TRIP_KEY)
     cnt = lambda df, s: int((df["status"] == s).sum())
     return pd.DataFrame({
-        "Item": ["Railway week", "Diagram dates", "Diagram days",
+        "Item": ["Checked", "Diagram dates", "Diagram days",
                  "Trains checked", "Trains OK", "Trains failed", "Trains not checked",
                  "Diagram rows", "Diagram rows with an issue", "After-midnight trains", "Generated"],
         "Value": [wk_label, f"{week_dates[0]:%d/%m/%Y} to {week_dates[-1]:%d/%m/%Y}", days_label,

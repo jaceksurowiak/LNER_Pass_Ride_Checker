@@ -56,8 +56,13 @@ against Realtime Trains, and produces **WKxx PASS RIDES.xlsx**.
 
 1. Upload **pass-trips.csv**. The railway week is read from the file's diagram dates.
 2. Optional: upload an updated **RailReferences.csv** for this run.
-3. Check the **railway week** shown in the sidebar and pick the **diagram days** (Sat–Fri).
-4. **Run check**, review the Issues tab, then **Download WKxx PASS RIDES.xlsx**.
+3. Choose what to check:
+   - **A weekly file** (one railway week): the week is fixed from the file, e.g. **WK43**.
+   - **An LTP file** (diagrams valid across many weeks): pick **Entire LTP period** to check every date,
+     named after the timetable, e.g. **DEC26 WTT** (Network Rail's "2027 Principal Timetable"),
+     or **One railway week** to check a single week of it.
+   Then pick the **diagram days** (Sat–Fri).
+4. **Run check**, review the Issues tab (repeated problems are grouped for LTP checks), then download **WKxx PASS RIDES.xlsx** or **DEC26 WTT PASS RIDES.xlsx**. LTP reports have an extra **By week** sheet.
 
 ### How it decides things
 
